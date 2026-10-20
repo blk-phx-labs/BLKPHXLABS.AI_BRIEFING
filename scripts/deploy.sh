@@ -55,7 +55,7 @@ log "Deployment complete."
 
 # The Gemini key lives only in Secret Manager, never in env vars (deploy output prints those).
 # To rotate it, add a new version; the next cold start picks it up:
-#   printf '%s' "\$NEW_KEY" | gcloud secrets versions add ${GEMINI_SECRET} --data-file=-
+#   printf '%s' "$NEW_KEY" | gcloud secrets versions add ${GEMINI_SECRET} --data-file=-
 
 # ---- Print status ----
 echo ""
