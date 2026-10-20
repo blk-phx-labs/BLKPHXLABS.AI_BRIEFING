@@ -52,10 +52,25 @@ else
   log "Creating GCS bucket: ${BUCKET_NAME}"
   gsutil mb -p "$PROJECT_ID" -l "$REGION" -b on "gs://${BUCKET_NAME}"
 
-  # Allow public read for dashboard and media files
-  gsutil iam ch allUsers:objectViewer "gs://${BUCKET_NAME}"
-  
-  log "Bucket created with public read access."
+  # Private: holds the job queue (Gmail alert payloads), memory and assets.
+  log "Bucket created (private)."
+fi
+
+# ---- Create public briefing bucket ----
+# Only the published video, audio and briefing JSON go here. allUsers gets
+# legacyObjectReader (read by exact name, no listing), and only blkphxlabs.com
+# may fetch from a browser script.
+PUBLIC_BUCKET="blkphxlabs-briefing"
+if gsutil ls "gs://${PUBLIC_BUCKET}" &>/dev/null; then
+  warn "Bucket gs://${PUBLIC_BUCKET} already exists — skipping."
+else
+  log "Creating public briefing bucket: ${PUBLIC_BUCKET}"
+  gcloud storage buckets create "gs://${PUBLIC_BUCKET}" --project="$PROJECT_ID" --location=US --uniform-bucket-level-access
+  echo '[{"origin": ["https://blkphxlabs.com"], "method": ["GET", "HEAD"], "responseHeader": ["Content-Type", "Range", "Content-Range", "Accept-Ranges"], "maxAgeSeconds": 3600}]' > /tmp/briefing-cors.json
+  gcloud storage buckets update "gs://${PUBLIC_BUCKET}" --cors-file=/tmp/briefing-cors.json
+  gcloud storage buckets add-iam-policy-binding "gs://${PUBLIC_BUCKET}" \
+    --member=allUsers --role=roles/storage.legacyObjectReader --format=none
+  log "Public briefing bucket created."
 fi
 
 # ---- Create required GCS folders (via placeholder objects) ----
