@@ -96,7 +96,8 @@ while t_b < 120:
     f0 = int(t_b * FPS); blinks.update(range(f0, f0 + 3)); t_b += rng.uniform(2.5, 4.5)
 
 # 3. Text helpers matching the Canva layout.
-serif = ImageFont.truetype("C:/Windows/Fonts/georgia.ttf", round(62 * S))
+# Jersey 10 matches the plates' blocky lettering and stays readable at caption size.
+caption = ImageFont.truetype("fonts/Jersey10-Regular.ttf", round(86 * S))
 pixel = ImageFont.truetype(f"{fonts}/silkscreen-latin-400-normal.woff2", round(70 * S))
 
 def wrap(d, text, font, width):
@@ -117,9 +118,29 @@ d = ImageDraw.Draw(intro)
 date = "[ MON · OCT 19 ]"
 d.text((W / 2, round(1180 * S)), date, font=pixel, fill=(240, 237, 232), anchor="mm")
 end = plate("end")
+d = ImageDraw.Draw(end)
+# The Canva end plate leaves these two lines out so they share the caption font.
+d.text((W / 2, round(1193 * S)), "Sources and full analysis", font=caption, fill=(240, 227, 195), anchor="mm")
+d.text((W / 2, round(1433 * S)), "See you tomorrow", font=ImageFont.truetype("fonts/Jersey10-Regular.ttf", round(76 * S)),
+       fill=(240, 227, 195), anchor="mm")
 main_base = plate("main")
 
 INTRO_S, END_S = 1.6, 2.4
+
+# Caption pages: a long sentence is split into pages of up to 4 lines, each shown for its share of the
+# sentence's speech time (by character count), so text never overflows the caption box.
+MAX_LINES = 4
+_d = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+pages = []
+for a, b, sent in timings:
+    lines = wrap(_d, sent, caption, round(800 * S))
+    per = math.ceil(len(lines) / math.ceil(len(lines) / MAX_LINES))   # balanced: 5 lines -> 3 + 2, not 4 + 1
+    chunks = [lines[i:i + per] for i in range(0, len(lines), per)]
+    total = sum(len(" ".join(c)) for c in chunks)
+    t0 = a
+    for i, c in enumerate(chunks):
+        t1 = b + GAP if i == len(chunks) - 1 else t0 + (b - a) * len(" ".join(c)) / total
+        pages.append((t0, t1, c)); t0 = t1
 
 def render(style):
     out = f"{work}/sample_{style}.mp4"
@@ -141,11 +162,11 @@ def render(style):
         img = main_base.copy()
         img.paste(cache[idx], (BOX[0] + (BOX[2] - side) // 2, BOX[1] + (BOX[3] - side) // 2))
         now = f / FPS
-        cap = next((s for a, b, s in timings if a <= now < b + GAP), "")
+        lines = next((ln for a, b, ln in pages if a <= now < b), [])
         dd = ImageDraw.Draw(img)
         y = round(1372 * S)
-        for ln in wrap(dd, cap, serif, round(800 * S))[:5]:
-            dd.text((round(96 * S), y), ln, font=serif, fill=(249, 241, 222)); y += round(72 * S)
+        for ln in lines:
+            dd.text((round(96 * S), y), ln, font=caption, fill=(249, 241, 222)); y += round(100 * S)
         emit(img)
     for _ in range(int(END_S * FPS)):
         emit(end)
