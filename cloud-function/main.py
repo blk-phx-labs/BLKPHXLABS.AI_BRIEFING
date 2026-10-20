@@ -799,6 +799,80 @@ def deliver_private_notes(bucket, briefing: dict):
         print(f"[PRIVATE] Webhook failed: {e}")
 
 
+def notify_discord(payload: dict, file_path: Optional[str] = None):
+    """Post to the founder's private Discord channel. Optional, and never breaks the run."""
+    import os
+    url = os.environ.get("DISCORD_WEBHOOK_URL")
+    if not url:
+        return
+    body = {"username": "LabMind", **payload}
+    try:
+        if file_path:
+            # Multipart: the message as payload_json plus the file (the Reel is ~2 MB, under Discord's limit).
+            with open(file_path, "rb") as f:
+                resp = httpx.post(url, data={"payload_json": json.dumps(body)},
+                                  files={"files[0]": (os.path.basename(file_path), f, "video/mp4")},
+                                  timeout=60.0)
+        else:
+            resp = httpx.post(url, json=body, timeout=10.0)
+        print(f"[DISCORD] {resp.status_code}")
+    except Exception as e:
+        print(f"[DISCORD] Failed: {type(e).__name__}")
+
+
+INSTAGRAM_COLLAB = "spamzy4L"
+HASHTAGS = "#celltherapy #genetherapy #CGT #biomanufacturing #labops #biotech"
+
+
+def instagram_caption(briefing: dict) -> str:
+    """Caption for the day's Reel, built from the analysis (no extra model call)."""
+    analysis = briefing["analysis"]
+    lead     = analysis.get("lead") or {}
+    first    = re.split(r"(?<=[.!?])\s+", str(lead.get("what_happened", "")).strip())[0]
+    notable  = [i.get("headline", "") for i in (analysis.get("also_notable") or []) if isinstance(i, dict)]
+    lines    = [str(lead.get("headline", "")).strip(), "", first]
+    if notable:
+        lines += ["", "Also notable:"] + [f"• {h}" for h in notable if h]
+    lines += ["", "Sources and full analysis: blkphxlabs.com/briefing (link in bio)", "",
+              "LabMind is a daily AI-assisted briefing from BLK PHX LABS.", "", HASHTAGS]
+    return "\n".join(lines)[:2200]
+
+
+def discord_reel(briefing: dict) -> dict:
+    return {"content": (
+        "**Today's Reel**: save the video, then post it on @blkphxlabs as a Reel.\n"
+        f"Tag people → **Invite collaborator** → @{INSTAGRAM_COLLAB}, and accept the invite from that account.\n"
+        "Caption (tap and hold to copy):\n"
+        f"```\n{instagram_caption(briefing)}\n```")[:2000]}
+
+
+def discord_summary(briefing: dict) -> dict:
+    analysis = briefing["analysis"]
+    lead     = analysis.get("lead") or {}
+    notable  = "\n".join(f"- {i.get('headline', '')}" for i in (analysis.get("also_notable") or [])
+                         if isinstance(i, dict))
+    conf     = analysis.get("confidence") or {}
+    return {
+        "content": f"**Today's LabMind is live:** {BRIEFING_URL}",
+        "embeds": [{
+            "title":       str(lead.get("headline", "LabMind"))[:256],
+            "url":         BRIEFING_URL,
+            "description": str(lead.get("why_it_matters", ""))[:1500],
+            "color":       0xE8520A,
+            "fields": [
+                {"name": "Also notable",  "value": notable[:1024] or "None today"},
+                {"name": "Private notes", "value": briefing["private_notes"][:1024] or "None today"},
+            ],
+            "footer": {"text": f"Confidence: {conf.get('level', '?')} | {briefing['source_count']} sources"},
+        }],
+    }
+
+
+def redact(text: str) -> str:
+    # Gemini errors echo the request URL, key included.
+    return re.sub(r"(key|access_token)=[^&\s'\"]+", lambda m: m.group(1) + "=***", text)
+
+
 # ============================================================
 # 8. MAIN CLOUD EVENT TRIGGER
 # ============================================================
@@ -848,6 +922,8 @@ def generate_content(cloud_event):
         prior_facts = load_memory(bucket)
         briefing    = write_briefing(api_key, articles, prior_facts)
         if not briefing:
+            notify_discord({"content": "No LabMind briefing today: nothing relevant made it through triage, "
+                                       "or a writing step failed. Check the function logs."})
             return
         script_text   = briefing["script"]
         current_facts = briefing["facts"]
@@ -901,10 +977,14 @@ def generate_content(cloud_event):
         except Exception:
             pass
 
+        notify_discord(discord_summary(briefing))
+        notify_discord(discord_reel(briefing), file_path=output_video)
         print("[PIPELINE] ===== SUCCESS =====")
 
     except Exception as e:
-        print(f"[CRITICAL] Unhandled exception: {e}")
+        print(f"[CRITICAL] Unhandled exception: {redact(str(e))}")
+        notify_discord({"content": f"LabMind run failed: `{type(e).__name__}: {redact(str(e))[:300]}`. "
+                                   "The page still shows the last good briefing."})
         import traceback
         traceback.print_exc()
         raise
