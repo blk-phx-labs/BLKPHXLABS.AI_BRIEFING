@@ -228,7 +228,7 @@ Tag every numbered item below.
 
 tier:
 - "core": CGT or biomanufacturing operations. Manufacturing process, scale-up, CMC, GMP, quality and QA, batch records, deviations, release testing, CDMOs, supply chain and vein-to-vein logistics, manufacturing automation and analytics, regulatory actions that change how CGT products are made or released, and business moves by CGT manufacturers.
-- "adjacent": the wider field a CGT founder should know. CGT approvals and clinical readouts, gene editing, AI in drug discovery or protein design, lab automation and lab software, biotech funding and M&A.
+- "adjacent": the wider field a CGT founder should know. CGT approvals and clinical readouts, gene editing, stem cells and iPSCs, regenerative medicine and tissue engineering, AI in drug discovery or protein design, lab automation and lab software, biotech funding and M&A.
 - "skip": everything else. That includes items that only share a keyword (cars, energy, chips, space, art, education software), stock tips and price targets, insider-trading or stock-option filings, career guides, and market-size or market-forecast reports (openPR, MarketsandMarkets, IndexBox and similar), even when the market is biomanufacturing.
 
 score, 0-10, for how much a CGT manufacturing leader should care today:
