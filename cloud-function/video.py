@@ -1,7 +1,7 @@
 """
 Daily Reel: Canva plates + a sprite host with generic lip-sync + per-sentence captions.
 
-Timeline: intro card (date) -> host reads the intro and lead with captions -> one "Also notable"
+Timeline: host opens on the lead headline (hook) while reading the intro, then the lead with captions -> one "Also notable"
 card per item, headline on top and the spoken sentence as caption -> end card for the sign-off.
 
 Speech comes from `synthesize(text) -> 16-bit mono PCM at SAMPLE_RATE`, one call per sentence, so
@@ -18,7 +18,7 @@ FPS, W, H = 24, 720, 1280
 S = W / 1080                      # plates and layout coordinates are 1080x1920 (Canva)
 SAMPLE_RATE = 24000
 GAP = 0.35                        # pause after each sentence, seconds
-INTRO_S, END_S = 1.6, 1.5         # silent intro card; hold on the end card after the voice
+INTRO_S, END_S = 0.0, 1.5         # no silent intro (Reels are judged in the first second); end-card hold
 
 # Files under ASSET_PREFIX in the working bucket.
 ASSET_PREFIX = "assets/"
@@ -28,7 +28,7 @@ ASSET_FILES = [
     "fonts/Jersey10-Regular.ttf", "fonts/Silkscreen-Regular.ttf",
 ]
 
-CREAM, MUTED = (249, 241, 222), (240, 227, 195)
+CREAM, MUTED, ORANGE = (249, 241, 222), (240, 227, 195), (232, 82, 10)
 HOST_BOX = (66, 181, 948, 942)    # host area inside the main plate's orange frame
 EYES = (285, 345, 445, 395)       # blink patch, in sprite coordinates
 CAPTION = (96, 1372, 800, 4)      # main plate caption box: left, top, width, max lines
@@ -90,7 +90,7 @@ def _pages(draw, text, font, width, max_lines, start, end):
 
 
 def render_reel(script: str, notable_headlines: list, date_label: str, synthesize, assets: str,
-                out_mp4: str, out_mp3: str) -> dict:
+                out_mp4: str, out_mp3: str, hook: str = "") -> dict:
     A = lambda p: os.path.join(assets, p)
     caption_font = ImageFont.truetype(A("fonts/Jersey10-Regular.ttf"), round(86 * S))
     notable_cap_font = ImageFont.truetype(A("fonts/Jersey10-Regular.ttf"), round(64 * S))
@@ -166,7 +166,11 @@ def render_reel(script: str, notable_headlines: list, date_label: str, synthesiz
     measure = ImageDraw.Draw(Image.new("RGB", (1, 1)))
     pages = []          # (start, end, kind, lines, segment index)
     for idx, (kind, sentence, head, a, b) in enumerate(timeline):
-        if kind == "host":
+        if idx == 0 and kind == "host" and hook:
+            # Hook first: while the intro sentence plays, the screen already shows the day's story.
+            left, top, width, lines = CAPTION
+            pages.append((a, b, "hook", _wrap(measure, hook, caption_font, sc(width))[:lines], idx))
+        elif kind == "host":
             left, top, width, lines = CAPTION
             pages += [(p0, p1, kind, ln, idx) for p0, p1, ln in
                       _pages(measure, sentence, caption_font, sc(width), lines, a, b)]
@@ -248,9 +252,10 @@ def render_reel(script: str, notable_headlines: list, date_label: str, synthesiz
                 left, top, width, _ = CAPTION
                 y = sc(top)
                 for ln in lines:
-                    dd.text((sc(left), y), ln, font=caption_font, fill=CREAM); y += sc(100)
+                    dd.text((sc(left), y), ln, font=caption_font, fill=ORANGE if kind == "hook" else CREAM)
+                    y += sc(100)
                 return im
-            emit(("host", page_i, mouth, blink), draw_host)
+            emit((kind, page_i, mouth, blink), draw_host)
 
     end_bytes = end.tobytes()
     for _ in range(int(END_S * FPS)):

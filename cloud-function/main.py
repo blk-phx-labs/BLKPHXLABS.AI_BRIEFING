@@ -613,6 +613,7 @@ Return JSON:
             "why_it_matters": "2-3 sentences for people who make, test or release CGT products"}},
   "also_notable": [{{"fact_ids": ["F2"], "headline": "max 12 words", "summary": "1-2 sentences"}}],
   "confidence": {{"level": "high | medium | low", "reason": "one sentence about source quality"}},
+  "discussion_question": "see below",
   "private_notes": "see below"
 }}
 
@@ -623,6 +624,7 @@ Rules:
 - Use only the facts. Mark inference with "likely" or "may". No numbers, names or dates that aren't in the facts.
 - When a company uses a buzzword for its own work ("autonomous science", "AI-native"), attribute it: "what Danaher calls autonomous science".
 - Plain words a QA or manufacturing lead would use. No hype or filler: never "breakthrough", "game-changer", "revolutionary", "critical clarity", "ensuring compliance", "streamlining".
+- discussion_question: one question about the lead that a CGT manufacturing or QA practitioner could answer from their own experience in a comment (max 20 words). Concrete, not rhetorical, no yes/no fishing for agreement. Example: "What would it take for your QA team to release on an automated potency assay?"
 - private_notes: for the founder only, never published. 3 to 5 lines, each starting with "- ". Specific and blunt: name the companies, groups or regulators in today's facts that matter to a CGT manufacturing software startup and say why (likely competitor, possible customer or design partner, signal about what buyers will need). No generic positioning statements, and stay within CGT manufacturing and QA. End with one concrete action for this week, such as a person or company to contact, a document to read, or a question to put to prospects. Don't assume LabOps.AI has any particular feature; it is early stage.
 """
     print(f"[PASS 2] Running analysis for {current_date}...")
@@ -824,26 +826,69 @@ INSTAGRAM_COLLAB = "spamzy4L"
 HASHTAGS = "#celltherapy #genetherapy #CGT #biomanufacturing #labops #biotech"
 
 
+def _first_sentence(text) -> str:
+    return re.split(r"(?<=[.!?])\s+", str(text or "").strip())[0]
+
+
+def featured_companies(briefing: dict) -> list:
+    """Companies and institutions behind the lead and also-notable items, worth tagging when posting."""
+    facts, names = briefing.get("facts") or [], []
+    analysis = briefing["analysis"]
+    for item in [analysis.get("lead") or {}] + list(analysis.get("also_notable") or []):
+        for fid in (item.get("fact_ids") or []) if isinstance(item, dict) else []:
+            m = re.fullmatch(r"F(\d+)", str(fid))
+            if m and 0 < int(m.group(1)) <= len(facts):
+                name = str(facts[int(m.group(1)) - 1].get("company_or_institution") or "").strip()
+                if name and name.lower() not in ("none", "null") and name not in names:
+                    names.append(name)
+    return names
+
+
 def instagram_caption(briefing: dict) -> str:
     """Caption for the day's Reel, built from the analysis (no extra model call)."""
     analysis = briefing["analysis"]
     lead     = analysis.get("lead") or {}
-    first    = re.split(r"(?<=[.!?])\s+", str(lead.get("what_happened", "")).strip())[0]
     notable  = [i.get("headline", "") for i in (analysis.get("also_notable") or []) if isinstance(i, dict)]
-    lines    = [str(lead.get("headline", "")).strip(), "", first]
+    question = str(analysis.get("discussion_question") or "").strip()
+    lines    = [str(lead.get("headline", "")).strip(), "", _first_sentence(lead.get("what_happened"))]
     if notable:
         lines += ["", "Also notable:"] + [f"• {h}" for h in notable if h]
+    if question:
+        lines += ["", question]
     lines += ["", "Sources and full analysis: blkphxlabs.com/briefing (link in bio)", "",
               "LabMind is a daily AI-assisted briefing from BLK PHX LABS.", "", HASHTAGS]
     return "\n".join(lines)[:2200]
 
 
+def linkedin_post(briefing: dict) -> str:
+    """Same story for LinkedIn: hook, what happened, the founder's read, a question, the link."""
+    analysis = briefing["analysis"]
+    lead     = analysis.get("lead") or {}
+    question = str(analysis.get("discussion_question") or "").strip()
+    lines    = [str(lead.get("headline", "")).strip(), "",
+                str(lead.get("what_happened", "")).strip(), "",
+                "My read: " + str(lead.get("why_it_matters", "")).strip()]
+    if question:
+        lines += ["", question]
+    lines += ["", "Daily CGT manufacturing briefing, with sources: https://blkphxlabs.com/briefing/", "",
+              "#CellTherapy #GeneTherapy #Biomanufacturing"]
+    return "\n".join(lines)[:2800]
+
+
 def discord_reel(briefing: dict) -> dict:
+    tags = featured_companies(briefing)
     return {"content": (
         "**Today's Reel**: save the video, then post it on @blkphxlabs as a Reel.\n"
         f"Tag people → **Invite collaborator** → @{INSTAGRAM_COLLAB}, and accept the invite from that account.\n"
-        "Caption (tap and hold to copy):\n"
+        + (f"Worth tagging: {', '.join(tags)}\n" if tags else "")
+        + "Caption (tap and hold to copy):\n"
         f"```\n{instagram_caption(briefing)}\n```")[:2000]}
+
+
+def discord_linkedin(briefing: dict) -> dict:
+    return {"content": (
+        "**LinkedIn**: post the same video natively (not a link), with this text:\n"
+        f"```\n{linkedin_post(briefing)}\n```")[:2000]}
 
 
 def discord_summary(briefing: dict) -> dict:
@@ -948,7 +993,8 @@ def generate_content(cloud_event):
         output_video = "/tmp/final.mp4"
         audio_path   = "/tmp/final.mp3"
         info = video.render_reel(script_text, headlines, f"[ {now:%a} · {now:%b} {now.day} ]".upper(),
-                                 synthesize, assets, output_video, audio_path)
+                                 synthesize, assets, output_video, audio_path,
+                                 hook=str((briefing["analysis"].get("lead") or {}).get("headline", "")))
         print(f"[VIDEO] Production complete | {info}")
 
         ts = int(time.time())
@@ -979,6 +1025,7 @@ def generate_content(cloud_event):
 
         notify_discord(discord_summary(briefing))
         notify_discord(discord_reel(briefing), file_path=output_video)
+        notify_discord(discord_linkedin(briefing))
         print("[PIPELINE] ===== SUCCESS =====")
 
     except Exception as e:
