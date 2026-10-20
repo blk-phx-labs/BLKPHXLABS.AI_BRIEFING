@@ -3,9 +3,9 @@ then a denoise (median + shared palette) so compression speckle doesn't shimmer 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
 
-RAW = "host3/raw/{:04d}.png"
+RAW = "frames/{:04d}.png"   # ffmpeg -i Photos-1-001/cowboy_final.mp4 frames/%04d.png
 BASE, PICKS = 7, {"half": 43, "open": 25}
-BLINK = "host3/g_blink.png"   # Gemini edit of the base frame; the clip's own blink (151) tilts the head
+BLINK = "g_blink.png"   # Gemini edit of the base frame; the clip's own blink (151) tilts the head
 MOUTH = (320, 440, 420, 520)      # in base-frame coordinates
 EYES = (285, 345, 445, 395)
 
@@ -42,9 +42,9 @@ sprites["blink"] = patched(base, BLINK, EYES, (240, 300, 500, 560))   # whole fa
 clean = {k: v.filter(ImageFilter.MedianFilter(3)) for k, v in sprites.items()}
 palette = clean["closed"].quantize(colors=48, method=Image.Quantize.MEDIANCUT)
 for k, v in clean.items():
-    v.quantize(palette=palette, dither=Image.Dither.NONE).convert("RGB").save(f"host3/sprites/{k}.png")
+    v.quantize(palette=palette, dither=Image.Dither.NONE).convert("RGB").save(f"sprites/{k}.png")
 
 sheet = Image.new("RGB", (220 * 4, 260))
 for i, k in enumerate(("closed", "half", "open", "blink")):
-    sheet.paste(Image.open(f"host3/sprites/{k}.png").crop((250, 300, 470, 560)), (220 * i, 0))
-sheet.save("host3/sprites_sheet.png")
+    sheet.paste(Image.open(f"sprites/{k}.png").crop((250, 300, 470, 560)), (220 * i, 0))
+sheet.save("sprites_sheet.png")
