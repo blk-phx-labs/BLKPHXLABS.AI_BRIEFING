@@ -799,17 +799,51 @@ def deliver_private_notes(bucket, briefing: dict):
         print(f"[PRIVATE] Webhook failed: {e}")
 
 
-def notify_discord(payload: dict):
+def notify_discord(payload: dict, file_path: Optional[str] = None):
     """Post to the founder's private Discord channel. Optional, and never breaks the run."""
     import os
     url = os.environ.get("DISCORD_WEBHOOK_URL")
     if not url:
         return
+    body = {"username": "LabMind", **payload}
     try:
-        resp = httpx.post(url, json={"username": "LabMind", **payload}, timeout=10.0)
+        if file_path:
+            # Multipart: the message as payload_json plus the file (the Reel is ~2 MB, under Discord's limit).
+            with open(file_path, "rb") as f:
+                resp = httpx.post(url, data={"payload_json": json.dumps(body)},
+                                  files={"files[0]": (os.path.basename(file_path), f, "video/mp4")},
+                                  timeout=60.0)
+        else:
+            resp = httpx.post(url, json=body, timeout=10.0)
         print(f"[DISCORD] {resp.status_code}")
     except Exception as e:
         print(f"[DISCORD] Failed: {type(e).__name__}")
+
+
+INSTAGRAM_COLLAB = "spamzy4L"
+HASHTAGS = "#celltherapy #genetherapy #CGT #biomanufacturing #labops #biotech"
+
+
+def instagram_caption(briefing: dict) -> str:
+    """Caption for the day's Reel, built from the analysis (no extra model call)."""
+    analysis = briefing["analysis"]
+    lead     = analysis.get("lead") or {}
+    first    = re.split(r"(?<=[.!?])\s+", str(lead.get("what_happened", "")).strip())[0]
+    notable  = [i.get("headline", "") for i in (analysis.get("also_notable") or []) if isinstance(i, dict)]
+    lines    = [str(lead.get("headline", "")).strip(), "", first]
+    if notable:
+        lines += ["", "Also notable:"] + [f"• {h}" for h in notable if h]
+    lines += ["", "Sources and full analysis: blkphxlabs.com/briefing (link in bio)", "",
+              "LabMind is a daily AI-assisted briefing from BLK PHX LABS.", "", HASHTAGS]
+    return "\n".join(lines)[:2200]
+
+
+def discord_reel(briefing: dict) -> dict:
+    return {"content": (
+        "**Today's Reel**: save the video, then post it on @blkphxlabs as a Reel.\n"
+        f"Tag people → **Invite collaborator** → @{INSTAGRAM_COLLAB}, and accept the invite from that account.\n"
+        "Caption (tap and hold to copy):\n"
+        f"```\n{instagram_caption(briefing)}\n```")[:2000]}
 
 
 def discord_summary(briefing: dict) -> dict:
@@ -944,6 +978,7 @@ def generate_content(cloud_event):
             pass
 
         notify_discord(discord_summary(briefing))
+        notify_discord(discord_reel(briefing), file_path=output_video)
         print("[PIPELINE] ===== SUCCESS =====")
 
     except Exception as e:
