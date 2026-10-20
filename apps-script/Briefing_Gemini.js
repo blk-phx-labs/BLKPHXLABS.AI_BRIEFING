@@ -1,10 +1,13 @@
 /**
- * LABMIND MASTER AUTOMATION (V31 - FULL PAYLOAD + RELEVANCE HANDOFF)
+ * LABMIND MASTER AUTOMATION (V33 - NO KEY IN JOB PAYLOAD)
  * Role: "The Scout" (Gmail Crawler → GCS Trigger → Sheets Logger)
+ *
+ * CHANGES FROM V31:
+ * - The job file no longer carries the Gemini key (the Cloud Function has its own)
+ * - resetGCSAuth() clears only the OAuth token, not every Script Property
  *
  * SECURITY: All secrets loaded from Script Properties — never hardcoded.
  * Set these in: Project Settings → Script Properties
- *   GEMINI_API_KEY   → your AIzaSy... key
  *   RAW_PRIVATE_KEY  → your -----BEGIN PRIVATE KEY----- block
  *   CLIENT_EMAIL     → briefing-bot@gen-lang-client-0207242913.iam.gserviceaccount.com
  */
@@ -24,7 +27,6 @@ const BRIEFING_SHEET_ID = '1ji1clDmv7YNARpY3TG39ADIC_pbCfdw_fPKVb3lEVLA';
 function getSecrets() {
   const props = PropertiesService.getScriptProperties();
   return {
-    GEMINI_API_KEY: props.getProperty('GEMINI_API_KEY'),
     RAW_PRIVATE_KEY: props.getProperty('RAW_PRIVATE_KEY'),
     CLIENT_EMAIL: props.getProperty('CLIENT_EMAIL'),
   };
@@ -89,8 +91,7 @@ function dispatchRAGJob(articles, secrets) {
 
   const payload = {
     action:   'deep_dive_rag',
-    articles: uniqueArticles.slice(0, 200),
-    api_key:  secrets.GEMINI_API_KEY        // Loaded from Script Properties
+    articles: uniqueArticles.slice(0, 200)
   };
 
   Logger.log(`Dispatching RAG job with ${payload.articles.length} articles.`);
@@ -148,8 +149,8 @@ function getGcpService(secrets) {
 
 function resetGCSAuth() {
   const secrets = getSecrets();
+  // reset() removes only the cached OAuth token; the service-account key stays in Script Properties.
   getGcpService(secrets).reset();
-  PropertiesService.getScriptProperties().deleteAllProperties();
   Logger.log('Authorization cleared. Re-run compileWeeklyBriefing to re-authenticate.');
 }
 
