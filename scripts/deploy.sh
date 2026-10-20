@@ -48,7 +48,7 @@ gcloud functions deploy "$FUNCTION_NAME" \
   --trigger-event-filters="bucket=${BUCKET_NAME}" \
   --trigger-location="us" \
   --set-env-vars="GCP_PROJECT=${PROJECT_ID}" \
-  --set-secrets="GEMINI_API_KEY=${GEMINI_SECRET}:latest,WEBHOOK_SECRET=briefing-webhook-secret:latest" \
+  --set-secrets="GEMINI_API_KEY=${GEMINI_SECRET}:latest,WEBHOOK_SECRET=briefing-webhook-secret:latest,DISCORD_WEBHOOK_URL=discord-webhook-url:latest" \
   --quiet
 
 log "Deployment complete."

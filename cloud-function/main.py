@@ -799,6 +799,46 @@ def deliver_private_notes(bucket, briefing: dict):
         print(f"[PRIVATE] Webhook failed: {e}")
 
 
+def notify_discord(payload: dict):
+    """Post to the founder's private Discord channel. Optional, and never breaks the run."""
+    import os
+    url = os.environ.get("DISCORD_WEBHOOK_URL")
+    if not url:
+        return
+    try:
+        resp = httpx.post(url, json={"username": "LabMind", **payload}, timeout=10.0)
+        print(f"[DISCORD] {resp.status_code}")
+    except Exception as e:
+        print(f"[DISCORD] Failed: {type(e).__name__}")
+
+
+def discord_summary(briefing: dict) -> dict:
+    analysis = briefing["analysis"]
+    lead     = analysis.get("lead") or {}
+    notable  = "\n".join(f"- {i.get('headline', '')}" for i in (analysis.get("also_notable") or [])
+                         if isinstance(i, dict))
+    conf     = analysis.get("confidence") or {}
+    return {
+        "content": f"**Today's LabMind is live:** {BRIEFING_URL}",
+        "embeds": [{
+            "title":       str(lead.get("headline", "LabMind"))[:256],
+            "url":         BRIEFING_URL,
+            "description": str(lead.get("why_it_matters", ""))[:1500],
+            "color":       0xE8520A,
+            "fields": [
+                {"name": "Also notable",  "value": notable[:1024] or "None today"},
+                {"name": "Private notes", "value": briefing["private_notes"][:1024] or "None today"},
+            ],
+            "footer": {"text": f"Confidence: {conf.get('level', '?')} | {briefing['source_count']} sources"},
+        }],
+    }
+
+
+def redact(text: str) -> str:
+    # Gemini errors echo the request URL, key included.
+    return re.sub(r"(key|access_token)=[^&\s'\"]+", lambda m: m.group(1) + "=***", text)
+
+
 # ============================================================
 # 8. MAIN CLOUD EVENT TRIGGER
 # ============================================================
@@ -848,6 +888,8 @@ def generate_content(cloud_event):
         prior_facts = load_memory(bucket)
         briefing    = write_briefing(api_key, articles, prior_facts)
         if not briefing:
+            notify_discord({"content": "No LabMind briefing today: nothing relevant made it through triage, "
+                                       "or a writing step failed. Check the function logs."})
             return
         script_text   = briefing["script"]
         current_facts = briefing["facts"]
@@ -901,10 +943,13 @@ def generate_content(cloud_event):
         except Exception:
             pass
 
+        notify_discord(discord_summary(briefing))
         print("[PIPELINE] ===== SUCCESS =====")
 
     except Exception as e:
-        print(f"[CRITICAL] Unhandled exception: {e}")
+        print(f"[CRITICAL] Unhandled exception: {redact(str(e))}")
+        notify_discord({"content": f"LabMind run failed: `{type(e).__name__}: {redact(str(e))[:300]}`. "
+                                   "The page still shows the last good briefing."})
         import traceback
         traceback.print_exc()
         raise
