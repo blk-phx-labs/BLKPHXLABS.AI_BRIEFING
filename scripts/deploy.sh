@@ -14,6 +14,7 @@ BUCKET_NAME="labmind-briefing-ops"
 FUNCTION_NAME="blkphxlabs-audio-engine"
 ENTRY_POINT="generate_content"
 RUNTIME="python311"
+GEMINI_SECRET="gemini-api-key"
 # ------------------------------------------------
 
 RED='\033[0;31m'
@@ -47,23 +48,14 @@ gcloud functions deploy "$FUNCTION_NAME" \
   --trigger-event-filters="bucket=${BUCKET_NAME}" \
   --trigger-location="us" \
   --set-env-vars="GCP_PROJECT=${PROJECT_ID}" \
+  --set-secrets="GEMINI_API_KEY=${GEMINI_SECRET}:latest" \
   --quiet
 
 log "Deployment complete."
 
-# ---- Set Gemini API key if available ----
-if [[ -n "${GEMINI_API_KEY:-}" ]]; then
-  log "Setting GEMINI_API_KEY on Cloud Run service..."
-  gcloud run services update "$FUNCTION_NAME" \
-    --region="$REGION" \
-    --update-env-vars "GEMINI_API_KEY=${GEMINI_API_KEY}" \
-    --quiet
-  log "GEMINI_API_KEY set."
-else
-  warn "GEMINI_API_KEY not set. Set it manually:"
-  warn "  export GEMINI_API_KEY='AIzaSy...'"
-  warn "  gcloud run services update $FUNCTION_NAME --region=$REGION --update-env-vars GEMINI_API_KEY=\$GEMINI_API_KEY"
-fi
+# The Gemini key lives only in Secret Manager, never in env vars (deploy output prints those).
+# To rotate it, add a new version; the next cold start picks it up:
+#   printf '%s' "$NEW_KEY" | gcloud secrets versions add ${GEMINI_SECRET} --data-file=-
 
 # ---- Print status ----
 echo ""
