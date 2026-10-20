@@ -1,6 +1,6 @@
 # BLK PHX LABS Intelligence Engine
 
-An autonomous biotech intelligence pipeline that scrapes Google Alerts, ranks and analyzes articles with a three-pass Gemini RAG engine, and publishes a spoken audio/video briefing to a GCS-hosted dashboard — daily at 6 AM.
+An autonomous biotech intelligence pipeline that scrapes Google Alerts, ranks and analyzes articles with a three-pass Gemini RAG engine, and publishes a spoken audio/video briefing to [blkphxlabs.com/briefing](https://blkphxlabs.com/briefing/) — daily at 6 AM.
 
 ```
 Gmail (Google Alerts)
@@ -12,7 +12,7 @@ Gmail (Google Alerts)
                     ├─► Three-pass analysis (Extract → Analyze → Narrate)
                     ├─► TTS synthesis (Google Cloud TTS)
                     ├─► Video production (MoviePy)
-                    └─► Dashboard (GCS index.html + Drive archive)
+                    └─► Publish (video, audio, briefing JSON → public bucket; Drive archive)
 ```
 
 ---
@@ -100,8 +100,8 @@ clasp push
 ### 5. Verify
 
 ```bash
-# Check dashboard
-open https://storage.googleapis.com/labmind-briefing-ops/index.html
+# Check the published briefing
+open https://blkphxlabs.com/briefing/
 
 # Tail Cloud Function logs
 gcloud functions logs read blkphxlabs-audio-engine --limit=50

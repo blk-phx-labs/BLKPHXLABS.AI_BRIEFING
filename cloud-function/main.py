@@ -1,7 +1,14 @@
 """
-BLK PHX LABS CLOUD FUNCTION (V34 - SEMANTIC RELEVANCE + DIAGNOSTIC FIX)
+BLK PHX LABS CLOUD FUNCTION (V35 - PUBLISH TO BLKPHXLABS.COM)
 
-CRITICAL CHANGES FROM V33:
+CHANGES FROM V34:
+  PUBLISHING:
+  - Video, audio and a briefing JSON go to a separate public bucket
+    (read by exact name only, no listing) that holds nothing else
+  - blkphxlabs.com/briefing/ renders the JSON; the old GCS dashboard page is gone
+  - The working bucket (job queue, memory, assets) no longer needs to be public
+
+CHANGES FROM V33 (V34):
   DIAGNOSTIC:
   - Enhanced logging throughout pipeline
   - Emergency fallback when no articles fit context budget
@@ -45,6 +52,8 @@ GEMINI_URL      = "https://generativelanguage.googleapis.com/v1beta/models/gemin
 WEBHOOK_URL     = "https://script.google.com/macros/s/AKfycbwhbNbEbx_SqdESnwwlpA4MJwGZf2iDHBk03o4vQOttrdWcyaRymj5MMYWxDDRtPgby/exec"
 DRIVE_FOLDER_ID = "1Lxg5T-XXa_bbwR_vWb34Gr-HCqjNo_Kp"
 MEMORY_BLOB     = "memory/last_week_facts.json"
+PUBLIC_BUCKET   = "blkphxlabs-briefing"
+BRIEFING_URL    = "https://blkphxlabs.com/briefing/"
 
 # CHANGED: Increased from 6000 to 20000
 RAG_CONTEXT_CHAR_LIMIT = 20000
@@ -598,150 +607,21 @@ def upload_to_drive(file_path: str, folder_id: str, file_name: str) -> Optional[
         return None
 
 
-def generate_dashboard_html(script_text: str, analysis: str, facts: list,
-                             video_url: str, audio_url: str, ts: int) -> str:
-    est     = ZoneInfo("America/New_York")
-    now_str = datetime.datetime.now(est).strftime("%Y-%m-%d %I:%M:%S %p EST")
-    formatted_script = script_text.replace('\n', '<br>')
-
-    fact_rows = ""
-    for f in facts[:8]:
-        domain   = f.get('domain', '—')
-        summary  = f.get('one_line_summary', '—')
-        strength = f.get('signal_strength', '—')
-        color    = {'high': '#00ff41', 'medium': '#ffaa00', 'low': '#ff4444'}.get(strength, '#888')
-        fact_rows += f"""
-        <tr>
-          <td style="color:{color}; padding:4px 8px;">{strength.upper()}</td>
-          <td style="padding:4px 8px; color:#aaa;">{domain}</td>
-          <td style="padding:4px 8px;">{summary}</td>
-        </tr>"""
-
-    analysis_preview = (
-        analysis[:600].replace('\n', '<br>') + "..."
-        if len(analysis) > 600
-        else analysis.replace('\n', '<br>')
-    )
-
-    return f"""<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>BLK PHX LABS // OPS</title>
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono&display=swap" rel="stylesheet">
-<style>
-  :root {{ --bg:#0a0a0a; --panel:#141414; --accent:#00ff41; --text:#eee; --dim:#888; }}
-  * {{ box-sizing: border-box; margin:0; padding:0; }}
-  body {{
-    background:var(--bg); color:var(--text);
-    font-family:'JetBrains Mono', monospace; padding:32px;
-  }}
-  body::before {{
-    content:" "; display:block; position:fixed;
-    top:0; left:0; bottom:0; right:0;
-    background:
-      linear-gradient(rgba(18,16,16,0) 50%, rgba(0,0,0,0.25) 50%),
-      linear-gradient(90deg, rgba(255,0,0,0.06), rgba(0,255,0,0.02), rgba(0,0,255,0.06));
-    z-index:2; background-size:100% 2px, 3px 100%; pointer-events:none;
-  }}
-  .header {{
-    border-bottom:1px solid var(--accent); padding-bottom:14px;
-    display:flex; justify-content:space-between; align-items:flex-start;
-    margin-bottom: 20px;
-  }}
-  .header-title {{ font-size:1.3rem; font-weight:bold; color:var(--accent); letter-spacing:3px; }}
-  .header-meta {{ font-size:0.7rem; color:var(--dim); text-align:right; line-height:1.9; }}
-  .grid {{ display:grid; grid-template-columns:3fr 2fr; gap:20px; }}
-  .panel {{
-    background:var(--panel); border:1px solid #222; padding:18px;
-    display:flex; flex-direction:column; gap:14px;
-  }}
-  .label {{ font-size:0.65rem; color:var(--accent); letter-spacing:3px; margin-bottom:4px; }}
-  video {{ width:100%; border:1px solid #2a2a2a; display:block; background:#000; }}
-  audio {{ width:100%; filter:invert(1); }}
-  .transcript {{
-    font-size:0.78rem; line-height:1.75; color:#ccc;
-    max-height:220px; overflow-y:auto;
-    border-top:1px solid #2a2a2a; padding-top:12px;
-  }}
-  .facts-table {{
-    width:100%; border-collapse:collapse;
-    font-size:0.72rem; color:var(--text);
-  }}
-  .facts-table th {{
-    text-align:left; padding:4px 8px;
-    color:var(--dim); font-weight:normal;
-    border-bottom:1px solid #1e1e1e;
-  }}
-  .facts-table tr:hover td {{ background:#1a1a1a; }}
-  .analysis-preview {{
-    font-size:0.75rem; line-height:1.7; color:#999;
-    max-height:160px; overflow-y:auto;
-    border-top:1px solid #1e1e1e; padding-top:10px;
-  }}
-  .status-bar {{
-    margin-top:18px; border-top:1px solid #1a1a1a; padding-top:12px;
-    display:flex; gap:28px; font-size:0.65rem; color:#333; letter-spacing:1px;
-  }}
-  .status-bar span {{ color:var(--accent); }}
-  ::-webkit-scrollbar {{ width:3px; }}
-  ::-webkit-scrollbar-track {{ background:#0a0a0a; }}
-  ::-webkit-scrollbar-thumb {{ background:#2a2a2a; }}
-</style></head><body>
-
-<header class="header">
-  <div class="header-title">BLK PHX LABS</div>
-  <div class="header-meta">SYNC ID: {ts}<br>{now_str}<br>SEMANTIC RAG v34</div>
-</header>
-
-<div class="grid">
-
-  <div>
-    <div class="label">// LIVE FEED</div>
-    <video controls autoplay loop muted playsinline src="{video_url}"></video>
-  </div>
-
-  <div style="display:flex; flex-direction:column; gap:16px;">
-
-    <div class="panel">
-      <div>
-        <div class="label">// AUDIO</div>
-        <audio controls src="{audio_url}"></audio>
-      </div>
-      <div class="transcript">
-        <div class="label">// TRANSCRIPT</div>
-        {formatted_script}
-      </div>
-    </div>
-
-    <div class="panel">
-      <div>
-        <div class="label">// SIGNAL TABLE ({len(facts)} SOURCES)</div>
-        <table class="facts-table">
-          <thead>
-            <tr>
-              <th>STRENGTH</th>
-              <th>DOMAIN</th>
-              <th>SUMMARY</th>
-            </tr>
-          </thead>
-          <tbody>{fact_rows}</tbody>
-        </table>
-      </div>
-      <div class="analysis-preview">
-        <div class="label">// INTELLIGENCE ANALYSIS</div>
-        {analysis_preview}
-      </div>
-    </div>
-
-  </div>
-</div>
-
-<div class="status-bar">
-  <div>STATUS: <span>NOMINAL</span></div>
-  <div>SOURCES: <span>{len(facts)}</span></div>
-  <div>PIPELINE: <span>SEMANTIC RAG</span></div>
-  <div>ARCHIVE: <span>DRIVE + GCS</span></div>
-</div>
-
-</body></html>"""
+def build_briefing_json(script_text: str, analysis: str, facts: list,
+                        video_url: str, audio_url: str, ts: int, source_count: int) -> str:
+    # Plain data only; blkphxlabs.com renders it as text, so scraped or model-written
+    # content can never become markup on the page.
+    est = ZoneInfo("America/New_York")
+    return json.dumps({
+        "generated_at": datetime.datetime.now(est).isoformat(timespec="seconds"),
+        "sync_id":      ts,
+        "video_url":    video_url,
+        "audio_url":    audio_url,
+        "transcript":   script_text,
+        "analysis":     analysis,
+        "facts":        facts,
+        "source_count": source_count,
+    }, ensure_ascii=False, indent=2)
 
 
 # ============================================================
@@ -877,18 +757,24 @@ def generate_content(cloud_event):
         archive_name = f"BLK PHX LABS_Raw_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.mp4"
         drive_id     = upload_to_drive(output_video, DRIVE_FOLDER_ID, archive_name)
 
-        bucket.blob("latest_briefing.mp3").upload_from_filename(audio_path, content_type='audio/mpeg')
-        bucket.blob("latest_briefing.mp4").upload_from_filename(output_video, content_type='video/mp4')
+        # Publish: only these three files are public, and only in PUBLIC_BUCKET.
+        public_bucket = storage_client.bucket(PUBLIC_BUCKET)
+        public_bucket.blob("latest_briefing.mp3").upload_from_filename(audio_path, content_type='audio/mpeg')
+        public_bucket.blob("latest_briefing.mp4").upload_from_filename(output_video, content_type='video/mp4')
 
-        video_url     = f"https://storage.googleapis.com/{bucket_name}/latest_briefing.mp4?v={ts}"
-        audio_url     = f"https://storage.googleapis.com/{bucket_name}/latest_briefing.mp3?v={ts}"
-        dashboard_url = f"https://storage.googleapis.com/{bucket_name}/index.html"
+        video_url     = f"https://storage.googleapis.com/{PUBLIC_BUCKET}/latest_briefing.mp4?v={ts}"
+        audio_url     = f"https://storage.googleapis.com/{PUBLIC_BUCKET}/latest_briefing.mp3?v={ts}"
+        dashboard_url = BRIEFING_URL
 
-        html_content = generate_dashboard_html(
-            script_text, analysis, current_facts, video_url, audio_url, ts
+        briefing_blob = public_bucket.blob("latest_briefing.json")
+        # The name never changes, so browsers must revalidate to see each new run.
+        briefing_blob.cache_control = "no-cache"
+        briefing_blob.upload_from_string(
+            build_briefing_json(script_text, analysis, current_facts,
+                                video_url, audio_url, ts, len(successful_sources)),
+            content_type='application/json'
         )
-        bucket.blob("index.html").upload_from_string(html_content, content_type='text/html')
-        print(f"[ARCHIVE] Drive: {drive_id} | Dashboard: {dashboard_url}")
+        print(f"[ARCHIVE] Drive: {drive_id} | Published: {dashboard_url}")
 
         # Callback
         try:
