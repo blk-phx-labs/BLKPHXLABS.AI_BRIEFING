@@ -83,3 +83,8 @@ yarn-error.log*
 
 # Claude Code
 .claude/
+
+# Video planning media stays local (brief section 7: no media in the repo)
+images/
+Photos-1-001/
+*.zip
