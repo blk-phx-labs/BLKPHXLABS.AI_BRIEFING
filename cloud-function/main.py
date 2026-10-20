@@ -31,10 +31,8 @@ CHANGES FROM V33 (V34):
 import functions_framework
 from google.cloud import texttospeech
 from google.cloud import storage
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
 
-import json, tempfile, time, math, random, datetime, re
+import json, tempfile, time, math, random, datetime, re, html, email.utils
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import httpx
 from urllib.parse import urlparse
@@ -42,6 +40,7 @@ from typing import Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup
+from xml.etree import ElementTree
 
 
 # ============================================================
@@ -50,13 +49,32 @@ from bs4 import BeautifulSoup
 VOICE_NAME      = "en-US-Journey-D"
 GEMINI_URL      = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
 WEBHOOK_URL     = "https://script.google.com/macros/s/AKfycbwhbNbEbx_SqdESnwwlpA4MJwGZf2iDHBk03o4vQOttrdWcyaRymj5MMYWxDDRtPgby/exec"
-DRIVE_FOLDER_ID = "1Lxg5T-XXa_bbwR_vWb34Gr-HCqjNo_Kp"
 MEMORY_BLOB     = "memory/last_week_facts.json"
 PUBLIC_BUCKET   = "blkphxlabs-briefing"
 BRIEFING_URL    = "https://blkphxlabs.com/briefing/"
+PRIVATE_PREFIX  = "private/notes/"   # in the working bucket; never public
 
-# CHANGED: Increased from 6000 to 20000
-RAG_CONTEXT_CHAR_LIMIT = 20000
+# Pass 1 reads the whole context, so this is what the model actually sees (~8-10 fragments).
+RAG_CONTEXT_CHAR_LIMIT = 14000
+
+# Trade-press feeds read alongside Google Alerts; alerts alone miss most CGT manufacturing news.
+FEEDS = [
+    "https://www.cgtlive.com/rss",
+    "https://www.bioprocessintl.com/rss.xml",
+    "https://www.fiercepharma.com/rss/manufacturing/xml",
+    "https://www.biopharmadive.com/feeds/news/",
+    "https://www.biopharmadive.com/feeds/topic/gene-therapy/",
+    "https://endpts.com/feed",
+    "https://www.genengnews.com/feed",
+    "https://www.regmednet.com/feed/",
+    "https://www.labiotech.eu/feed/",
+    "https://www.nature.com/nbt.rss",
+    "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/biologics/rss.xml",
+    "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/press-releases/rss.xml",
+]
+FEED_MAX_AGE_HOURS = 36
+FEED_MAX_ITEMS     = 8      # per feed, newest first
+MAX_FACT_AGE_DAYS  = 30     # older facts are background, not news
 
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
@@ -196,103 +214,153 @@ def fetch_all_articles(articles: list) -> list:
 
 
 # ============================================================
-# 4. SEMANTIC RELEVANCE SCORING (NEW!)
+# 4. RELEVANCE TRIAGE (V36: one batched call, two tiers)
 # ============================================================
-def score_relevance_semantic(title: str, fragment: str, api_key: str) -> Tuple[int, list]:
+# Who the briefing is for. Every prompt shares this so the tiers mean the same thing throughout.
+AUDIENCE = (
+    "BLK PHX LABS is an early-stage company building LabOps.AI, decision-support software for "
+    "cell and gene therapy (CGT) manufacturing and quality teams."
+)
+
+SCORE_BATCH_SIZE = 40
+MIN_RELEVANCE    = 3
+
+
+def score_articles_batch(articles: list, fragments: list, api_key: str) -> dict:
     """
-    NEW: Uses Gemini to score relevance semantically instead of keyword matching.
-    Much more robust to varied terminology and phrasing.
-    
-    Returns: (relevance_score 0-10, list of matched domains)
+    Triage every article in one Gemini call per SCORE_BATCH_SIZE items (V34 made one call each).
+    Seeing the items side by side also keeps the scores comparable instead of all landing at 7-9.
+
+    Returns: {index: (tier, score, domain)} where tier is core | adjacent | skip
     """
-    prompt = f"""You are a biotech intelligence filter for a venture focused on:
-- CRISPR & gene editing technologies
-- AI-driven drug discovery and protein design
-- Lab automation and autonomous research platforms
-- Cell therapy, gene therapy, tissue engineering
-- Synthetic biology and biomanufacturing
-- Digital lab operations (LIMS, ELN, data platforms)
-- Competitive intelligence: M&A, funding rounds, regulatory changes
+    results = {}
+    for start in range(0, len(fragments), SCORE_BATCH_SIZE):
+        items = []
+        for i in range(start, min(start + SCORE_BATCH_SIZE, len(fragments))):
+            frag  = fragments[i] or ""
+            title = articles[i].get("title", "") if i < len(articles) else ""
+            text  = frag.split("TEXT:", 1)[-1].strip()[:300]
+            items.append(f"[{i}] {title}\nPreview: {text}")
 
-Score this article's relevance on a 0-10 scale:
+        prompt = f"""You triage news for a daily briefing. {AUDIENCE}
 
-Article Title: {title}
-Article Preview: {fragment[:1000]}
+Tag every numbered item below.
 
-Return ONLY valid JSON with NO markdown fences, preamble, or explanation:
-{{
-  "relevance_score": <integer 0-10>,
-  "domains": ["<domain1>", "<domain2>"],
-  "reasoning": "<one sentence max>"
-}}
+tier:
+- "core": CGT or biomanufacturing operations. Manufacturing process, scale-up, CMC, GMP, quality and QA, batch records, deviations, release testing, CDMOs, supply chain and vein-to-vein logistics, manufacturing automation and analytics, regulatory actions that change how CGT products are made or released, and business moves by CGT manufacturers.
+- "adjacent": the wider field a CGT founder should know. CGT approvals and clinical readouts, gene editing, stem cells and iPSCs, regenerative medicine and tissue engineering, AI in drug discovery or protein design, lab automation and lab software, biotech funding and M&A.
+- "skip": everything else. That includes items that only share a keyword (cars, energy, chips, space, art, education software), stock tips and price targets, insider-trading or stock-option filings, career guides, and market-size or market-forecast reports (openPR, MarketsandMarkets, IndexBox and similar), even when the market is biomanufacturing.
 
-Scoring guide:
-0-2 = Irrelevant (general news, unrelated science)
-3-5 = Tangentially related (adjacent fields, indirect relevance)
-6-8 = Relevant (directly related to focus areas)
-9-10 = Critical intelligence (major breakthrough, strategic opportunity, competitive threat)
+score, 0-10, for how much a CGT manufacturing leader should care today:
+- 9-10: rare, at most 2 items in this list. A concrete event that changes plans: FDA or EMA action, an approval or clinical hold, a manufacturing failure or recall, a major deal or financing in CGT manufacturing.
+- 6-8: a specific, sourced development: new data, a product launch, a partnership, a draft guidance.
+- 3-5: commentary, opinion, perspectives, reviews, incremental research. Opinion pieces stay in this band even when the topic is important.
+- 0-2: skip-tier material.
+
+Judge only from the text given. Return a JSON array with one object per item:
+[{{"id": <number>, "tier": "core|adjacent|skip", "score": <0-10>, "domain": "<2-4 words>"}}]
+
+ITEMS:
+{chr(10).join(items)}
 """
-    
+        batch = generate_gemini_text(api_key, prompt, expect_json=True, max_tokens=4096)
+        if not isinstance(batch, list):
+            print(f"[TRIAGE] Batch at {start} failed to parse; those items fall back to adjacent/2")
+            continue
+        for row in batch:
+            try:
+                idx   = int(row.get("id"))
+                tier  = row.get("tier") if row.get("tier") in ("core", "adjacent", "skip") else "adjacent"
+                score = max(0, min(10, int(row.get("score", 0))))
+                results[idx] = (tier, score, str(row.get("domain") or "unknown"))
+            except (TypeError, ValueError):
+                continue
+
+    tiers = [t for t, _, _ in results.values()]
+    print(f"[TRIAGE] {len(results)}/{len(fragments)} tagged | core={tiers.count('core')} "
+          f"adjacent={tiers.count('adjacent')} skip={tiers.count('skip')}")
+    return results
+
+
+def parse_feed_date(stamp: Optional[str]) -> Optional[datetime.datetime]:
+    # RSS uses RFC 822, Atom uses ISO 8601, and Fierce uses its own "Oct 12, 2026 7:44am".
+    stamp = (stamp or "").strip()
+    parsers = (lambda v: datetime.datetime.fromisoformat(v.replace("Z", "+00:00")),
+               email.utils.parsedate_to_datetime,
+               lambda v: datetime.datetime.strptime(v, "%b %d, %Y %I:%M%p"))
+    for parse in parsers:
+        try:
+            when = parse(stamp)
+            return when if when.tzinfo else when.replace(tzinfo=datetime.timezone.utc)
+        except (TypeError, ValueError, IndexError):
+            continue
+    return None
+
+
+def fetch_feed(url: str, since: datetime.datetime) -> list:
+    """Recent items from one RSS or Atom feed as {title, url}; an unreachable feed just returns []."""
     try:
-        response = httpx.post(
-            GEMINI_URL,
-            params={'key': api_key},
-            headers={'Content-Type': 'application/json'},
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "temperature": 0.2,
-                    "maxOutputTokens": 500,
-                    "thinkingConfig": {"thinkingBudget": 0}
-                }
-            },
-            timeout=httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0)
-        )
-        
-        if response.status_code == 200:
-            raw = response.json()['candidates'][0]['content']['parts'][0]['text']
-            clean = re.sub(r'<thinking>.*?</thinking>', '', raw, flags=re.DOTALL)
-            clean = clean.strip().replace('```json', '').replace('```', '').strip()
-
-            # Find JSON object bounds
-            start = clean.find('{')
-            end = clean.rfind('}') + 1
-            if start >= 0 and end > start:
-                clean = clean[start:end]
-
-            result = json.loads(clean)
-            score = result.get('relevance_score', 0)
-            domains = result.get('domains', [])
-            reasoning = result.get('reasoning', '')
-            
-            print(f"[SEMANTIC] {score}/10 | {domains} | {title[:50]}")
-            if reasoning:
-                print(f"[SEMANTIC]   → {reasoning}")
-            
-            return (score, domains)
-        else:
-            print(f"[SEMANTIC] API error {response.status_code} for: {title[:50]}")
-            
-    except json.JSONDecodeError as e:
-        print(f"[SEMANTIC] JSON parse error for {title[:50]}: {e}")
+        r = httpx.get(url, headers={"User-Agent": random.choice(USER_AGENTS)},
+                      timeout=HTTPX_TIMEOUT, follow_redirects=True)
+        r.raise_for_status()
+        root = ElementTree.fromstring(r.content)
     except Exception as e:
-        print(f"[SEMANTIC] Unexpected error for {title[:50]}: {e}")
-    
-    # Fallback: assign low score but don't drop
-    return (2, ['unknown'])
+        print(f"[FEEDS] {type(e).__name__} | {url}")
+        return []
+    items = []
+    for node in root.iter():
+        tag = node.tag.rsplit("}", 1)[-1]
+        if tag not in ("item", "entry"):
+            continue
+        fields = {c.tag.rsplit("}", 1)[-1]: c for c in node}
+        # itertext: some feeds (Fierce) wrap the title in a child element, leaving .text empty.
+        title = "".join(fields["title"].itertext()).strip() if "title" in fields else ""
+        link  = fields.get("link")
+        href  = ((link.text or "").strip() or link.get("href", "")) if link is not None else ""
+        stamp = next((fields[k].text for k in ("pubDate", "published", "updated", "date") if k in fields), None)
+        when = parse_feed_date(stamp)
+        if title and href.startswith("http") and (when is None or when >= since):
+            items.append({"title": title, "url": href})
+        if len(items) >= FEED_MAX_ITEMS:
+            break
+    return items
+
+
+def fetch_feeds(now: datetime.datetime) -> list:
+    since = now - datetime.timedelta(hours=FEED_MAX_AGE_HOURS)
+    with ThreadPoolExecutor(max_workers=len(FEEDS)) as executor:
+        per_feed = list(executor.map(lambda u: fetch_feed(u, since), FEEDS))
+    for url, items in zip(FEEDS, per_feed):
+        print(f"[FEEDS] {len(items):2d} | {url}")
+    return [item for items in per_feed for item in items]
+
+
+def merge_feed_articles(articles: list, feed_items: list) -> list:
+    # Feeds are already capped per source, so they skip the per-domain cap; only drop repeat URLs.
+    seen = {a.get("url") for a in articles}
+    merged = list(articles)
+    for item in feed_items:
+        if item["url"] not in seen:
+            seen.add(item["url"])
+            merged.append({**item, "title": html.unescape(item["title"])})
+    return merged
 
 
 def deduplicate_by_domain(articles: list, max_per_domain: int = 3, hard_cap: int = 150) -> list:
     domain_counts: dict = {}
+    seen_urls: set = set()
     unique = []
     for item in articles:
-        domain = urlparse(item.get('url', '')).netloc
-        if not domain:
+        url    = item.get('url', '')
+        domain = urlparse(url).netloc
+        if not domain or url in seen_urls:
             continue
         count = domain_counts.get(domain, 0)
         if count < max_per_domain:
             domain_counts[domain] = count + 1
-            unique.append(item)
+            seen_urls.add(url)
+            # Gmail alert titles arrive with HTML entities (&#39;, &amp;).
+            unique.append({**item, 'title': html.unescape(item.get('title', ''))})
         if len(unique) >= hard_cap:
             break
     return unique
@@ -301,15 +369,17 @@ def deduplicate_by_domain(articles: list, max_per_domain: int = 3, hard_cap: int
 def rank_and_chunk_context(
     articles: list,
     raw_fragments: list,
-    api_key: str,  # NEW: Need API key for semantic scoring
+    api_key: str,
     max_chars: int = RAG_CONTEXT_CHAR_LIMIT
 ) -> Tuple[str, list]:
     """
-    UPDATED: Now uses semantic scoring via Gemini instead of keyword matching.
-    Much more robust to varied terminology.
+    Triage, drop skips and low scores, put core items ahead of adjacent ones, and fill the
+    context budget. Each fragment is labelled [S1], [S2], ... so pass 1 can cite it and the
+    code (not the model) attaches the URL.
     """
     print(f"[RAG] Starting ranking with {len(raw_fragments)} raw fragments")
-    
+    triage = score_articles_batch(articles, raw_fragments, api_key)
+
     scored = []
     for i, frag in enumerate(raw_fragments):
         if not frag or not frag.strip():
@@ -325,67 +395,42 @@ def rank_and_chunk_context(
         else:
             signal_tier = 4
 
-        title = articles[i].get("title", "") if i < len(articles) else ""
-        
-        # NEW: Semantic relevance scoring
-        relevance, domains = score_relevance_semantic(title, frag, api_key)
+        tier, relevance, domain = triage.get(i, ("adjacent", 2, "unknown"))
+        if tier == "skip" or relevance < MIN_RELEVANCE:
+            continue
 
-        if relevance > 0:
-            final_score = relevance * signal_tier
-        else:
-            final_score = signal_tier * 0.1
-
+        article = articles[i] if i < len(articles) else {}
         scored.append({
-            "score":      final_score,
-            "relevance":  relevance,
-            "signal":     signal_tier,
-            "domains":    domains,
-            "fragment":   frag,
-            "title":      title,
+            # Core outranks adjacent unless the adjacent item is far stronger.
+            "score":     relevance * signal_tier + (12 if tier == "core" else 0),
+            "relevance": relevance,
+            "signal":    signal_tier,
+            "tier":      tier,
+            "domains":   [domain],
+            "fragment":  frag,
+            "title":     article.get("title", ""),
+            "url":       article.get("url", ""),
         })
 
     scored.sort(key=lambda x: x["score"], reverse=True)
-
-    high_relevance = len([s for s in scored if s['relevance'] >= 6])
-    medium_relevance = len([s for s in scored if 3 <= s['relevance'] < 6])
-    low_relevance = len([s for s in scored if s['relevance'] < 3])
-    
-    print(f"[RELEVANCE] Scored {len(scored)} fragments:")
-    print(f"[RELEVANCE]   High (6-10): {high_relevance}")
-    print(f"[RELEVANCE]   Medium (3-5): {medium_relevance}")
-    print(f"[RELEVANCE]   Low (0-2): {low_relevance}")
-
+    print(f"[RELEVANCE] Kept {len(scored)}/{len(raw_fragments)} | "
+          f"core={sum(s['tier'] == 'core' for s in scored)} adjacent={sum(s['tier'] == 'adjacent' for s in scored)}")
     for item in scored[:5]:
-        print(f"  score={item['score']:.1f} (rel={item['relevance']}, sig={item['signal']}) | {item['domains']} | {item['title'][:60]}")
+        print(f"  score={item['score']} ({item['tier']}, rel={item['relevance']}, sig={item['signal']}) | {item['title'][:60]}")
 
     # Greedy fill context budget
     selected_frags = []
     selected_meta  = []
     budget = 0
-    skipped_oversized = 0
-    
     for item in scored:
-        frag_len = len(item["fragment"])
-        if budget + frag_len > max_chars:
-            if frag_len > max_chars * 0.3:  # Fragment > 30% of budget
-                skipped_oversized += 1
+        labelled = f"[S{len(selected_meta) + 1}] {item['fragment']}"
+        if budget + len(labelled) > max_chars:
             continue
-        selected_frags.append(item["fragment"])
-        selected_meta.append(item)
-        budget += frag_len
+        selected_frags.append(labelled)
+        selected_meta.append({**item, "source_id": f"S{len(selected_meta) + 1}"})
+        budget += len(labelled)
 
     print(f"[RAG] Selected {len(selected_frags)}/{len(scored)} fragments ({budget:,} chars)")
-    if skipped_oversized > 0:
-        print(f"[RAG] Skipped {skipped_oversized} oversized fragments")
-
-    # NEW: Emergency fallback if nothing fit
-    if len(selected_frags) == 0 and len(scored) > 0:
-        print("[RAG] ⚠️ EMERGENCY FALLBACK: No articles fit budget — taking top 10 regardless")
-        emergency = scored[:10]
-        selected_frags = [e["fragment"][:2000] for e in emergency]  # Truncate to fit
-        selected_meta = emergency
-        print(f"[RAG] Emergency fallback: {len(selected_frags)} fragments (truncated)")
-
     return "\n".join(selected_frags), selected_meta
 
 
@@ -414,19 +459,30 @@ def save_memory(bucket, facts: list):
 
 
 # ============================================================
-# 6. THREE-PASS GEMINI ENGINE (Updated model)
+# 6. THREE-PASS GEMINI ENGINE (V36: sourced facts, two-tier analysis, founder voice)
 # ============================================================
-def generate_gemini_text(api_key: str, prompt: str, expect_json: bool = False):
+SPOKEN_BRAND   = "Black Phoenix Labs"   # how the TTS voice says BLK PHX LABS
+SCRIPT_WORDS   = (120, 150)             # about 60 seconds of speech
+# Words the public script may only use when attributing them to a source.
+BANNED_WORDS   = ("autonomous", "compliant", "compliance-ready", "ensuring compliance",
+                  "revolutionary", "game-changing", "game changer", "breakthrough", "critical clarity")
+
+
+def generate_gemini_text(api_key: str, prompt: str, expect_json: bool = False,
+                         max_tokens: Optional[int] = None):
+    config = {
+        "temperature":     0.3 if expect_json else 0.5,
+        "maxOutputTokens": max_tokens or (2048 if expect_json else 8192),
+        "thinkingConfig":  {"thinkingBudget": 0},
+    }
+    if expect_json:
+        config["responseMimeType"] = "application/json"
     data = {
         "contents": [{"parts": [{"text": prompt}]}],
         "safetySettings": [
             {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
         ],
-        "generationConfig": {
-            "temperature":    0.3 if expect_json else 0.5,
-            "maxOutputTokens": 2048 if expect_json else 8192,
-            "thinkingConfig": {"thinkingBudget": 0}
-        }
+        "generationConfig": config,
     }
     try:
         response = httpx.post(
@@ -434,7 +490,7 @@ def generate_gemini_text(api_key: str, prompt: str, expect_json: bool = False):
             params={'key': api_key},
             headers={'Content-Type': 'application/json'},
             json=data,
-            timeout=httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=5.0)
+            timeout=httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=5.0)
         )
         if response.status_code != 200:
             print(f"[GEMINI] Non-200: {response.status_code}")
@@ -443,34 +499,19 @@ def generate_gemini_text(api_key: str, prompt: str, expect_json: bool = False):
         raw = response.json()['candidates'][0]['content']['parts'][0]['text']
 
         if expect_json:
-            clean = re.sub(r'<thinking>.*?</thinking>', '', raw, flags=re.DOTALL)
-            clean = clean.strip()
+            clean = re.sub(r'<thinking>.*?</thinking>', '', raw, flags=re.DOTALL).strip()
             for fence in ["```json", "```JSON", "```"]:
                 clean = clean.replace(fence, "")
             clean = clean.strip()
-            # Strip control characters that break JSON parsing
-            clean = re.sub(r'[\x00-\x1f\x7f]', ' ', clean)
-            start = min(
-                (clean.find('[') if '[' in clean else len(clean)),
-                (clean.find('{') if '{' in clean else len(clean))
-            )
-            end_bracket = clean.rfind(']')
-            end_brace   = clean.rfind('}')
-            end = max(end_bracket, end_brace) + 1
-            if start < end:
-                clean = clean[start:end]
-            clean = re.sub(r',\s*([}\]])', r'\1', clean)
             try:
-                return json.loads(clean)
+                # strict=False accepts raw line breaks inside strings, which multi-line fields produce.
+                return json.loads(clean, strict=False)
             except json.JSONDecodeError:
-                # Fall back: extract only the outermost [ ] and retry
-                bracket_start = clean.find('[')
-                bracket_end = clean.rfind(']')
-                if bracket_start != -1 and bracket_end > bracket_start:
-                    clean = clean[bracket_start:bracket_end + 1]
-                    clean = re.sub(r',\s*([}\]])', r'\1', clean)
-                    return json.loads(clean)
-                raise
+                # Fall back: trim to the outermost brackets and drop trailing commas
+                start = min(i for i in (clean.find('['), clean.find('{'), len(clean)) if i >= 0)
+                end   = max(clean.rfind(']'), clean.rfind('}')) + 1
+                clean = re.sub(r',\s*([}\]])', r'\1', clean[start:end])
+                return json.loads(clean, strict=False)
 
         return raw
 
@@ -479,134 +520,191 @@ def generate_gemini_text(api_key: str, prompt: str, expect_json: bool = False):
         return None
 
 
-def pass1_extract_facts(api_key: str, ranked_context: str) -> list:
-    prompt = f"""
-You are a precise biotech intelligence analyst.
-Read the following research fragments and extract structured facts.
+def pass1_extract_facts(api_key: str, ranked_context: str, sources: list) -> list:
+    prompt = f"""You extract facts from news fragments for a daily briefing. {AUDIENCE}
+Each fragment starts with a source id such as [S3].
 
-Return ONLY a valid JSON array. No markdown, no explanation, no preamble.
-Each element must have exactly these fields:
+Return a JSON array. One object per distinct event: if several fragments report the same event, return it once and list every source id.
 {{
-  "source_title": "string",
+  "source_ids": ["S3"],
   "company_or_institution": "string or null",
-  "event_type": "funding | acquisition | research | product | regulation | other",
-  "key_metric": "string or null (dollar amount, percentage, measurement — only if explicitly stated)",
+  "event_type": "funding | acquisition | partnership | regulatory | clinical | manufacturing | research | product | other",
+  "key_metric": "string or null. Only a figure stated in the text: dollar amount, percentage, patient count, timeline",
   "date_mentioned": "string or null",
-  "domain": "string (e.g. CRISPR, synthetic biology, neurotechnology)",
-  "one_line_summary": "string (max 20 words, factual only)",
+  "event_date": "YYYY-MM-DD or null. When the event itself happened, only if the text states it (year and month at least; use day 01 if no day)",
+  "domain": "2-4 words, e.g. CAR-T manufacturing, gene editing, AI drug discovery",
+  "one_line_summary": "max 25 words, factual, no hype words",
   "signal_strength": "high | medium | low"
 }}
 
-If a field cannot be determined, use null. Do NOT invent values.
+signal_strength: high = a primary source or a concrete event; medium = credible secondary reporting; low = opinion, marketing, or a headline with little text.
+Use only what the fragments say; use null when a field isn't stated. A fragment marked [Signal Only] is just a headline: mark it low and add nothing beyond the headline.
+Leave out fragments that aren't news: ads, stock-option filings, market-size press releases.
 
 RESEARCH FRAGMENTS:
-{ranked_context[:12000]}
+{ranked_context}
 """
     print("[PASS 1] Running extraction...")
-    facts = generate_gemini_text(api_key, prompt, expect_json=True)
-
-    if not isinstance(facts, list):
+    raw_facts = generate_gemini_text(api_key, prompt, expect_json=True, max_tokens=4096)
+    if not isinstance(raw_facts, list):
         print("[PASS 1] Failed to parse JSON")
         return []
 
-    print(f"[PASS 1] Extracted {len(facts)} facts")
+    by_id = {s["source_id"]: s for s in sources}
+    facts, seen = [], set()
+    for f in raw_facts:
+        if not isinstance(f, dict):
+            continue
+        cited = [by_id[s] for s in f.get("source_ids") or [] if s in by_id]
+        if not cited:
+            continue   # an unattributable fact can't be published
+        key = (str(f.get("company_or_institution") or "").lower(), str(f.get("key_metric") or "").lower(),
+               str(f.get("one_line_summary") or "").lower()[:60])
+        if key in seen:
+            continue
+        seen.add(key)
+        # Links and tier come from the code's own records, never from model output.
+        f.pop("source_ids", None)
+        f["tier"]         = "core" if any(s["tier"] == "core" for s in cited) else "adjacent"
+        f["source_title"] = cited[0]["title"]
+        f["source_url"]   = cited[0]["url"]
+        f["sources"]      = [{"title": s["title"], "url": s["url"]} for s in cited]
+        facts.append(f)
+
+    print(f"[PASS 1] Extracted {len(facts)} facts "
+          f"(core={sum(f['tier'] == 'core' for f in facts)}, dropped {len(raw_facts) - len(facts)})")
     return facts
 
 
-def pass2_analyze(api_key: str, current_facts: list, prior_facts: list, current_date: str) -> str:
-    prior_block = ""
-    if prior_facts:
-        prior_summary = json.dumps(prior_facts, indent=2)
-        prior_block = f"""
-LAST WEEK'S FACTS:
-{prior_summary[:3000]}
+def fact_age_days(fact: dict, today: datetime.date) -> Optional[int]:
+    try:
+        return (today - datetime.date.fromisoformat(str(fact.get("event_date"))[:10])).days
+    except ValueError:
+        return None
+
+
+def pass2_analyze(api_key: str, current_facts: list, prior_facts: list, current_date: str,
+                  today: datetime.date) -> Optional[dict]:
+    numbered = [
+        {"id": f"F{i + 1}",
+         **{k: f.get(k) for k in ("tier", "company_or_institution", "event_type", "key_metric",
+                                  "domain", "one_line_summary", "signal_strength")},
+         # The model can see an opinion or vendor URL and how old the event is; it can't work either out itself.
+         "source_url": f.get("source_url"),
+         "days_old":   fact_age_days(f, today)}
+        for i, f in enumerate(current_facts)
+    ]
+    prior = [f.get("one_line_summary") for f in prior_facts if isinstance(f, dict) and f.get("one_line_summary")]
+
+    prompt = f"""You write today's LabMind briefing, {current_date}. {AUDIENCE}
+
+TODAY'S FACTS (tier "core" = CGT or biomanufacturing operations, "adjacent" = the wider field):
+{json.dumps(numbered, indent=1, ensure_ascii=False)}
+
+YESTERDAY'S HEADLINES (continuity only; don't present them as new unless today's facts add something):
+{json.dumps(prior[:15], ensure_ascii=False)}
+
+Return JSON:
+{{
+  "lead": {{"fact_ids": ["F1"], "headline": "max 12 words",
+            "what_happened": "2-3 sentences",
+            "why_it_matters": "2-3 sentences for people who make, test or release CGT products"}},
+  "also_notable": [{{"fact_ids": ["F2"], "headline": "max 12 words", "summary": "1-2 sentences"}}],
+  "confidence": {{"level": "high | medium | low", "reason": "one sentence about source quality"}},
+  "private_notes": "see below"
+}}
+
+Rules:
+- Lead: the most important "core" fact with medium or high strength that is actually new. days_old over 30 means background, not news: never lead with it, and if you mention it, give its date. A source_url containing /opinion/, /perspective/, /blog/, /sponsored/ or /spons/ is commentary or advertising, not news. If no core fact qualifies, lead with the strongest new fact of any tier. Don't apologize for it or say what it isn't (never \"while not directly about manufacturing\"); say what it means for CGT manufacturing and quality teams.
+- also_notable: 2 or 3 other items, ordered by how much they matter to CGT manufacturing and quality teams: CGT and biomanufacturing first, then gene editing, AI in drug discovery and lab automation. Leave out curiosities far from that (neurotech demos, consumer health, product advertorials). Don't repeat the lead.
+- confidence: "high" only if the lead comes from direct news reporting or a primary source with a clear date. Opinion pieces, vendor content, or headline-only sources mean "medium" or "low". Say which in the reason.
+- Use only the facts. Mark inference with "likely" or "may". No numbers, names or dates that aren't in the facts.
+- When a company uses a buzzword for its own work ("autonomous science", "AI-native"), attribute it: "what Danaher calls autonomous science".
+- Plain words a QA or manufacturing lead would use. No hype or filler: never "breakthrough", "game-changer", "revolutionary", "critical clarity", "ensuring compliance", "streamlining".
+- private_notes: for the founder only, never published. 3 to 5 lines, each starting with "- ". Specific and blunt: name the companies, groups or regulators in today's facts that matter to a CGT manufacturing software startup and say why (likely competitor, possible customer or design partner, signal about what buyers will need). No generic positioning statements, and stay within CGT manufacturing and QA. End with one concrete action for this week, such as a person or company to contact, a document to read, or a question to put to prospects. Don't assume LabOps.AI has any particular feature; it is early stage.
 """
-
-    current_block = json.dumps(current_facts, indent=2)
-
-    prompt = f"""
-Chief Intelligence Officer, {current_date}
-
-Analyze these biotech intelligence signals:
-
-THIS WEEK:
-{current_block}
-{prior_block}
-
-Produce rigorous contextual analysis:
-
-1. DOMINANT TREND: Most significant pattern this week?
-2. RECURRING ENTITIES: Companies/institutions appearing multiple times or from last week?
-3. EMERGING TECHNOLOGY: Which specific tech is gaining momentum?
-4. OPERATIONAL CONSEQUENCE: What should a biotech venture DO this week?
-5. CONFIDENCE: HIGH/MEDIUM/LOW based on source quality (explain why)
-6. WATCH NEXT WEEK: One specific thing to monitor
-
-ANTI-HALLUCINATION: Only reference data in the facts. Clearly distinguish confirmed vs inferred.
-"""
-    print("[PASS 2] Running analysis...")
-    analysis = generate_gemini_text(api_key, prompt, expect_json=False)
-
-    if not analysis:
+    print(f"[PASS 2] Running analysis for {current_date}...")
+    result = generate_gemini_text(api_key, prompt, expect_json=True, max_tokens=4096)
+    if not isinstance(result, dict) or not isinstance(result.get("lead"), dict):
         print("[PASS 2] Analysis failed")
-        return "Analysis unavailable. " + " | ".join(
-            f.get('one_line_summary', '') for f in current_facts if f.get('one_line_summary')
-        )
-
-    print(f"[PASS 2] Analysis complete ({len(analysis)} chars)")
-    return analysis
+        return None
+    print(f"[PASS 2] Lead: {result['lead'].get('headline')} | also_notable={len(result.get('also_notable') or [])}")
+    return result
 
 
-def pass3_narrate(api_key: str, analysis: str, current_date: str) -> str:
-    prompt = f"""
-You are "BLK PHX LABS Voice," autonomous Chief of Staff.
+def compose_public_analysis(analysis: dict) -> str:
+    # The page renders "**Heading**" lines as headings and "- " lines as bullets.
+    lead  = analysis.get("lead") or {}
+    lines = [f"**Lead: {lead.get('headline', '').strip()}**",
+             str(lead.get("what_happened", "")).strip(),
+             str(lead.get("why_it_matters", "")).strip()]
+    notable = analysis.get("also_notable") or []
+    if notable:
+        lines += ["", "**Also notable**"]
+        lines += [f"- **{n.get('headline', '').strip()}**: {str(n.get('summary', '')).strip()}" for n in notable]
+    conf = analysis.get("confidence") or {}
+    if conf.get("level"):
+        lines += ["", f"**Confidence: {str(conf['level']).capitalize()}**", str(conf.get("reason", "")).strip()]
+    return "\n".join(l for l in lines if l is not None)
 
-Rewrite this analysis as a 300-word spoken executive briefing.
 
-CLEAN READ:
-1. NO MARKDOWN — no asterisks, hashes, bullets
-2. NO ACRONYMS — spell everything phonetically
-3. SPOKEN CADENCE — calm, authoritative
-4. PRESERVE FACTS — don't add/remove claims
-5. CONFIDENCE LANGUAGE — hedge if analysis says MEDIUM/LOW
+def pass3_narrate(api_key: str, analysis: dict, spoken_date: str) -> Optional[str]:
+    public = {k: analysis.get(k) for k in ("lead", "also_notable", "confidence")}   # never the private notes
+    lo, hi = SCRIPT_WORDS
+    prompt = f"""Write the spoken script for today's LabMind briefing. A text-to-speech voice reads it over a short video.
+
+VOICE: the founder of {SPOKEN_BRAND}, talking to people who make and release cell and gene therapies. Calm, direct, a little opinionated, never hype. Use first person plural at least twice: once in the lead to give our take ("what we'd want to know is...", "our read:"), and once to say what we're watching next.
+
+LENGTH: {lo} to {hi} words. Never more than {hi + 10}.
 
 STRUCTURE:
-- Open: "System online. Date: {current_date}."
-- Body: Two paragraphs (trend + consequence)
-- Close: "End of line."
+1. Open with exactly: "This is LabMind from {SPOKEN_BRAND}, {spoken_date}."
+2. The lead story in about 70 words: what happened, why it matters for cell and gene therapy manufacturing, and our take.
+3. Say "Also notable." then cover the other items in one short sentence each (under 20 words).
+4. Close with exactly: "Sources and the full analysis are on our site. See you tomorrow."
 
-ANALYSIS:
-{analysis}
+RULES:
+- Plain text only: no markdown, bullets, asterisks, emoji, headings or stage directions.
+- Say common abbreviations as they are: FDA, CAR-T, GMP, AI, CDMO, CRISPR, AAV, M&A. Spell out any other abbreviation the first time.
+- Write numbers the way they're spoken: "forty to fifty billion dollars", "two point one billion".
+- Use only the content below. If confidence is low, say so in a few words.
+- Never describe what LabOps.AI does, and never claim customers or partners.
+- Never use these words except inside a clearly attributed quote of a source: {", ".join(BANNED_WORDS)}.
+
+CONTENT:
+{json.dumps(public, indent=1, ensure_ascii=False)}
 """
     print("[PASS 3] Running narration...")
-    script = generate_gemini_text(api_key, prompt, expect_json=False)
+    script = None
+    for attempt in (1, 2):
+        draft = generate_gemini_text(api_key, prompt, expect_json=False, max_tokens=1024)
+        if not draft:
+            break
+        script  = re.sub(r'[*#_`>]', '', draft).strip()
+        words   = len(script.split())
+        # A banned word is fine only inside an attribution ("what Danaher calls autonomous science").
+        flagged = [w for w in BANNED_WORDS
+                   if re.search(rf"(?<!calls )\b{re.escape(w)}", script.lower())]
+        print(f"[PASS 3] Draft {attempt}: {words} words" + (f" | flagged: {flagged}" if flagged else ""))
+        if words <= hi + 10 and not flagged:
+            break
+        problems = []
+        if words > hi + 10:
+            problems.append(f"it is {words} words; cut it to {lo}-{hi}")
+        if flagged:
+            problems.append(f"remove or attribute these words: {', '.join(flagged)}")
+        prompt += f"\n\nYOUR PREVIOUS DRAFT:\n{script}\n\nRewrite it: {'; '.join(problems)}. Keep everything else."
 
     if not script:
         print("[PASS 3] Narration failed")
         return None
-
-    script = script.replace('*', '').replace('#', '').replace('_', '').strip()
-    print(f"[PASS 3] Script ready ({len(script)} chars)")
+    print(f"[PASS 3] Script ready ({len(script.split())} words, {len(script)} chars)")
     return script
 
 
 # ============================================================
-# 7. PRODUCTION UTILS (Unchanged from V33)
+# 7. PRODUCTION UTILS
 # ============================================================
-def upload_to_drive(file_path: str, folder_id: str, file_name: str) -> Optional[str]:
-    try:
-        service       = build('drive', 'v3', cache_discovery=False)
-        file_metadata = {'name': file_name, 'parents': [folder_id]}
-        media         = MediaFileUpload(file_path, mimetype='video/mp4', resumable=True)
-        file          = service.files().create(
-            body=file_metadata, media_body=media, fields='id'
-        ).execute()
-        return file.get('id')
-    except Exception as e:
-        print(f"[DRIVE] Upload error: {e}")
-        return None
-
-
 def build_briefing_json(script_text: str, analysis: str, facts: list,
                         video_url: str, audio_url: str, ts: int, source_count: int) -> str:
     # Plain data only; blkphxlabs.com renders it as text, so scraped or model-written
@@ -624,8 +722,83 @@ def build_briefing_json(script_text: str, analysis: str, facts: list,
     }, ensure_ascii=False, indent=2)
 
 
+def write_briefing(api_key: str, articles: list, prior_facts: list,
+                   now: Optional[datetime.datetime] = None) -> Optional[dict]:
+    """Everything between the scraped articles and the finished text. No storage, TTS or video,
+    so it can be run locally against a saved article list."""
+    now = now or datetime.datetime.now(ZoneInfo("America/New_York"))
+
+    articles = merge_feed_articles(articles, fetch_feeds(now))
+    print(f"[FEEDS] {len(articles)} articles with feeds")
+
+    raw_fragments = fetch_all_articles(articles)
+    content_count = len([f for f in raw_fragments if f and '[Signal Only]' not in f])
+    print(f"[SCRAPER] {content_count}/{len(articles)} yielded content")
+
+    ranked_context, sources = rank_and_chunk_context(articles, raw_fragments, api_key)
+    if not ranked_context.strip():
+        print("[RAG] No relevant articles after triage; nothing to publish today")
+        return None
+
+    facts = pass1_extract_facts(api_key, ranked_context, sources)
+    fresh = [f for f in facts if (fact_age_days(f, now.date()) or 0) <= MAX_FACT_AGE_DAYS]
+    if len(fresh) < len(facts):
+        print(f"[PASS 1] Dropped {len(facts) - len(fresh)} facts older than {MAX_FACT_AGE_DAYS} days")
+    facts = fresh
+    if not facts:
+        print("[PASS 1] No facts extracted; nothing to publish today")
+        return None
+
+    analysis = pass2_analyze(api_key, facts, prior_facts, f"{now:%A, %B} {now.day}, {now.year}", now.date())
+    if not analysis:
+        return None
+
+    script = pass3_narrate(api_key, analysis, f"{now:%A, %B} {now.day}")
+    if not script:
+        return None
+
+    return {
+        "script":        script,
+        "analysis":      analysis,
+        "analysis_md":   compose_public_analysis(analysis),
+        "private_notes": str(analysis.get("private_notes") or "").strip(),
+        "facts":         facts,
+        "source_count":  len(sources),
+        "date":          now.strftime("%Y-%m-%d"),
+    }
+
+
+def deliver_private_notes(bucket, briefing: dict):
+    """Private notes go to the working bucket and to the Scout's web app, which prepends them to
+    the LabMind Private Notes Google Doc. They never touch the public bucket."""
+    notes = briefing["private_notes"]
+    if not notes:
+        return
+    lead = (briefing["analysis"].get("lead") or {}).get("headline", "")
+    try:
+        bucket.blob(f"{PRIVATE_PREFIX}{briefing['date']}.md").upload_from_string(
+            f"# {briefing['date']}: {lead}\n\n{notes}\n", content_type="text/markdown")
+    except Exception as e:
+        print(f"[PRIVATE] Bucket copy failed: {e}")
+
+    import os
+    secret = os.environ.get("WEBHOOK_SECRET")
+    if not secret:
+        print("[PRIVATE] WEBHOOK_SECRET not set; notes saved to the bucket only")
+        return
+    try:
+        # Apps Script answers POSTs with a redirect to the result.
+        resp = httpx.post(WEBHOOK_URL, follow_redirects=True, json={
+            "secret": secret, "type": "private_notes", "date": briefing["date"],
+            "lead": lead, "notes": notes, "briefing_url": BRIEFING_URL,
+        }, timeout=httpx.Timeout(connect=10.0, read=30.0, write=5.0, pool=5.0))
+        print(f"[PRIVATE] Notes doc: {resp.status_code} {resp.text[:80]}")
+    except Exception as e:
+        print(f"[PRIVATE] Webhook failed: {e}")
+
+
 # ============================================================
-# 8. MAIN CLOUD EVENT TRIGGER (Updated with semantic scoring)
+# 8. MAIN CLOUD EVENT TRIGGER
 # ============================================================
 @functions_framework.cloud_event
 def generate_content(cloud_event):
@@ -637,8 +810,8 @@ def generate_content(cloud_event):
         return
 
     try:
-        print("[PIPELINE] ===== V34 SEMANTIC RAG START =====")
-        
+        print("[PIPELINE] ===== V36 START =====")
+
         # Load secrets
         api_key = get_secret("GEMINI_API_KEY")
         print("[SECRETS] Credentials loaded")
@@ -666,42 +839,19 @@ def generate_content(cloud_event):
         print(f"[RAG] After dedup: {len(articles)} articles")
 
         if len(articles) == 0:
-            print("[RAG] ⚠️ CRITICAL: Zero articles in payload")
+            # Not fatal any more: the trade-press feeds still give the briefing something to work with.
+            print("[RAG] ⚠️ Zero alert articles in payload; continuing with feeds only")
             print("[RAG] Check Apps Script logs for Gmail sourcing issues")
-            return
 
-        raw_fragments = fetch_all_articles(articles)
-        content_count = len([f for f in raw_fragments if f and '[Signal Only]' not in f])
-        print(f"[SCRAPER] {content_count}/{len(articles)} yielded content")
-
-        # NEW: Pass api_key to rank_and_chunk_context for semantic scoring
-        ranked_context, scored_meta = rank_and_chunk_context(articles, raw_fragments, api_key)
-
-        if not ranked_context.strip():
-            print("[RAG] ⚠️ No content after ranking")
-            return
-
-        successful_sources = [m["title"] for m in scored_meta]
-        print(f"[RELEVANCE] {len(successful_sources)} articles in final context")
-
-        # Memory
         prior_facts = load_memory(bucket)
-
-        # Three-pass Gemini
-        current_date  = datetime.datetime.now().strftime("%B %d, %Y")
-
-        current_facts = pass1_extract_facts(api_key, ranked_context)
-        if not current_facts:
-            print("[PASS 1] ⚠️ No facts extracted")
-
-        analysis    = pass2_analyze(api_key, current_facts, prior_facts, current_date)
-        script_text = pass3_narrate(api_key, analysis, current_date)
-
-        if not script_text:
-            print("[PASS 3] ⚠️ Narration failed")
+        briefing    = write_briefing(api_key, articles, prior_facts)
+        if not briefing:
             return
+        script_text   = briefing["script"]
+        current_facts = briefing["facts"]
 
         save_memory(bucket, current_facts)
+        deliver_private_notes(bucket, briefing)
 
         # TTS → Audio
         s_input      = texttospeech.SynthesisInput(text=script_text)
@@ -752,10 +902,7 @@ def generate_content(cloud_event):
         )
         print("[VIDEO] Production complete")
 
-        # Archive
-        ts           = int(time.time())
-        archive_name = f"BLK PHX LABS_Raw_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.mp4"
-        drive_id     = upload_to_drive(output_video, DRIVE_FOLDER_ID, archive_name)
+        ts = int(time.time())
 
         # Publish: only these three files are public, and only in PUBLIC_BUCKET.
         public_bucket = storage_client.bucket(PUBLIC_BUCKET)
@@ -770,28 +917,11 @@ def generate_content(cloud_event):
         # The name never changes, so browsers must revalidate to see each new run.
         briefing_blob.cache_control = "no-cache"
         briefing_blob.upload_from_string(
-            build_briefing_json(script_text, analysis, current_facts,
-                                video_url, audio_url, ts, len(successful_sources)),
+            build_briefing_json(script_text, briefing["analysis_md"], current_facts,
+                                video_url, audio_url, ts, briefing["source_count"]),
             content_type='application/json'
         )
-        print(f"[ARCHIVE] Drive: {drive_id} | Published: {dashboard_url}")
-
-        # Callback
-        try:
-            resp = httpx.post(WEBHOOK_URL, json={
-                "status":        "success",
-                "script_text":   script_text,
-                "analysis":      analysis,
-                "fact_count":    len(current_facts),
-                "video_url":     video_url,
-                "audio_url":     audio_url,
-                "dashboard_url": dashboard_url,
-                "drive_id":      drive_id,
-                "source_count":  len(successful_sources)
-            }, timeout=httpx.Timeout(connect=10.0, read=15.0, write=5.0, pool=5.0))
-            print(f"[WEBHOOK] Callback: {resp.status_code}")
-        except Exception as e:
-            print(f"[WEBHOOK] Callback failed: {e}")
+        print(f"[PUBLISH] {dashboard_url}")
 
         try:
             lock_blob.delete()
