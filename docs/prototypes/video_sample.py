@@ -1,5 +1,5 @@
-"""Render a ~15 s LabMind sample Reel in two host styles (cream, orange) from the Canva plates.
-Usage: python sample.py <workdir> <host_clip.mp4> <plates_dir> <fonts_dir>   (GCP_TOKEN, GCP_PROJECT in env)"""
+"""Render a ~21 s LabMind sample Reel with the sprite host (generic lip-sync) from the Canva plates.
+Usage: python sample2.py <workdir> <unused> <plates_dir> <fonts_dir> <sprites_dir>   (GCP_TOKEN, GCP_PROJECT in env)"""
 import base64, json, os, subprocess, sys, wave, struct, math, urllib.request
 import imageio_ffmpeg
 from PIL import Image, ImageDraw, ImageFont, ImageOps
@@ -57,22 +57,43 @@ loud = [math.sqrt(sum(x * x for x in samples[i:i + per]) / per) if samples[i:i +
         for i in range(0, len(samples), per)]
 talking = [v > 900 for v in loud]
 
-# 2. Host frames: crop head-and-shoulders, style, upscale with hard pixels.
-os.makedirs(f"{work}/hf", exist_ok=True)
-if not os.listdir(f"{work}/hf"):
-    run("-i", clip, f"{work}/hf/%04d.png")
-host_paths = sorted(os.listdir(f"{work}/hf"))
-CLOSED = 36   # frame at 1.5 s: mouth closed (picked from the contact sheet)
-
+# 2. Host: sprite set (closed, half, open mouth; blink), switched by voice loudness.
+SPR = sys.argv[5]
+EYES = (285, 345, 445, 395)
 BOX = [round(v * S) for v in (66, 181, 948, 942)]          # host area inside the orange frame
 side = min(BOX[2], BOX[3])
 
-def styled(path, style):
-    im = Image.open(path).convert("RGB").crop((0, 40, 720, 760))
+def styled(im, style):
+    im = im.crop((0, 40, 720, 760))                          # head-and-shoulders, same framing as before
     if style == "orange":
         im = ImageOps.colorize(ImageOps.grayscale(im), black=(10, 10, 9), mid=(232, 82, 10),
                                white=(240, 237, 232), midpoint=150)
     return im.resize((side, side), Image.NEAREST)
+
+mouths = {m: Image.open(f"{SPR}/{m}.png").convert("RGB") for m in ("closed", "half", "open")}
+blink_eyes = Image.open(f"{SPR}/blink.png").convert("RGB").crop(EYES)
+def sprite(mouth, blink):
+    im = mouths[mouth].copy()
+    if blink:
+        im.paste(blink_eyes, EYES[:2])
+    return im
+
+# Mouth state per frame: thresholds from this voice's own loudness, held 2 frames so it doesn't flicker.
+voiced = sorted(v for v in loud if v > 900)
+T_HALF, T_OPEN = 900, voiced[len(voiced) * 3 // 5] if voiced else 3000
+mouth_at, cur, held = [], "closed", 0
+for v in loud:
+    want = "open" if v > T_OPEN else "half" if v > T_HALF else "closed"
+    if want != cur and held >= 2:
+        cur, held = want, 0
+    held += 1
+    mouth_at.append(cur)
+
+# Blinks every 2.5-4.5 s, 3 frames each (fixed seed so renders are repeatable).
+import random
+rng, blinks, t_b = random.Random(7), set(), 1.2
+while t_b < 120:
+    f0 = int(t_b * FPS); blinks.update(range(f0, f0 + 3)); t_b += rng.uniform(2.5, 4.5)
 
 # 3. Text helpers matching the Canva layout.
 serif = ImageFont.truetype("C:/Windows/Fonts/georgia.ttf", round(62 * S))
@@ -113,12 +134,10 @@ def render(style):
         emit(intro)
     hi = 0
     for f in range(int(speech_len * FPS)):
-        if f < len(talking) and talking[f]:
-            hi = (hi + 1) % len(host_paths); idx = hi
-        else:
-            idx = CLOSED
-        if idx not in cache:
-            cache[idx] = styled(f"{work}/hf/{host_paths[idx]}", style)
+        key = (mouth_at[f] if f < len(mouth_at) else "closed", f in blinks)
+        if key not in cache:
+            cache[key] = styled(sprite(*key), style)
+        idx = key
         img = main_base.copy()
         img.paste(cache[idx], (BOX[0] + (BOX[2] - side) // 2, BOX[1] + (BOX[3] - side) // 2))
         now = f / FPS
@@ -139,5 +158,4 @@ def render(style):
         "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", out)
     print(style, out, os.path.getsize(out) // 1024, "KB", f"{n / FPS:.1f}s")
 
-for st in ("cream", "orange"):
-    render(st)
+render("orange")
