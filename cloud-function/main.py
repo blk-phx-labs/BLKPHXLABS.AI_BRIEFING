@@ -247,8 +247,8 @@ def score_articles_batch(articles: list, fragments: list, api_key: str) -> dict:
 Tag every numbered item below.
 
 tier:
-- "core": CGT or biomanufacturing operations. Manufacturing process, scale-up, CMC, GMP, quality and QA, batch records, deviations, release testing, CDMOs, supply chain and vein-to-vein logistics, manufacturing automation and analytics, regulatory actions that change how CGT products are made or released, and business moves by CGT manufacturers.
-- "adjacent": the wider field a CGT founder should know. CGT approvals and clinical readouts, gene editing, stem cells and iPSCs, regenerative medicine and tissue engineering, AI in drug discovery or protein design, lab automation and lab software, biotech funding and M&A.
+- "core": cell and gene therapy (CGT) manufacturing and quality only: CAR-T, other cell therapies, gene therapies and viral vectors. Manufacturing process, scale-up, CMC, GMP, quality and QA, batch records, deviations, release testing, CDMOs, supply chain and vein-to-vein logistics, manufacturing automation and analytics, regulatory actions that change how CGT products are made or released, and business moves by CGT manufacturers and CGT CDMOs. Other biomanufacturing (generics, antibodies, ADCs, biosimilars, general bioprocessing) is "adjacent", not core.
+- "adjacent": the wider field a CGT founder should know. Biomanufacturing outside CGT, CGT approvals and clinical readouts, gene editing, stem cells and iPSCs, regenerative medicine and tissue engineering, AI in drug discovery or protein design, lab automation and lab software, biotech funding and M&A.
 - "skip": everything else. That includes items that only share a keyword (cars, energy, chips, space, art, education software), stock tips and price targets, insider-trading or stock-option filings, career guides, and market-size or market-forecast reports (openPR, MarketsandMarkets, IndexBox and similar), even when the market is biomanufacturing.
 
 score, 0-10, for how much a CGT manufacturing leader should care today:
@@ -598,7 +598,7 @@ def pass2_analyze(api_key: str, current_facts: list, prior_facts: list, current_
 
     prompt = f"""You write today's LabMind briefing, {current_date}. {AUDIENCE}
 
-TODAY'S FACTS (tier "core" = CGT or biomanufacturing operations, "adjacent" = the wider field):
+TODAY'S FACTS (tier "core" = CGT manufacturing and quality, "adjacent" = the wider field, including other biomanufacturing):
 {json.dumps(numbered, indent=1, ensure_ascii=False)}
 
 YESTERDAY'S HEADLINES (continuity only; don't present them as new unless today's facts add something):
