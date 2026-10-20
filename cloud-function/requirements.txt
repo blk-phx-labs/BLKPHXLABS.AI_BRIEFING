@@ -15,14 +15,9 @@ google-auth-oauthlib>=1.2.0
 # SCRAPER
 beautifulsoup4==4.12.3
 
-# MEDIA ENGINE (Pinned for stability)
-numpy==1.26.4
-moviepy==1.0.3
-Pillow==9.5.0
-decorator==4.4.2
-imageio==2.33.1
-imageio-ffmpeg==0.4.9
-proglog==0.1.10
+# MEDIA ENGINE (video.py: Pillow draws frames, ffmpeg from imageio-ffmpeg encodes)
+Pillow==11.3.0
+imageio-ffmpeg==0.6.0
 
 # HTTP (thread-safe scraping)
 httpx==0.27.0

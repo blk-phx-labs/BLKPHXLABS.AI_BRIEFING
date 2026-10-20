@@ -40,6 +40,8 @@ from typing import Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup
+
+import video
 from xml.etree import ElementTree
 
 
@@ -853,54 +855,25 @@ def generate_content(cloud_event):
         save_memory(bucket, current_facts)
         deliver_private_notes(bucket, briefing)
 
-        # TTS → Audio
-        s_input      = texttospeech.SynthesisInput(text=script_text)
-        voice_params = texttospeech.VoiceSelectionParams(
-            language_code="en-US", name=VOICE_NAME
-        )
-        audio_config = texttospeech.AudioConfig(
-            audio_encoding=texttospeech.AudioEncoding.MP3
-        )
-        tts_resp = tts_client.synthesize_speech(
-            input=s_input, voice=voice_params, audio_config=audio_config
-        )
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-            f.write(tts_resp.audio_content)
-            audio_path = f.name
-        print(f"[TTS] Audio: {audio_path}")
+        # Voice + video: one TTS call per sentence drives captions and the host's mouth (video.py).
+        def synthesize(text: str) -> bytes:
+            return tts_client.synthesize_speech(
+                input=texttospeech.SynthesisInput(text=text),
+                voice=texttospeech.VoiceSelectionParams(language_code="en-US", name=VOICE_NAME),
+                audio_config=texttospeech.AudioConfig(
+                    audio_encoding=texttospeech.AudioEncoding.LINEAR16,
+                    sample_rate_hertz=video.SAMPLE_RATE),
+            ).audio_content
 
-        # Video Production
-        from moviepy.editor import VideoFileClip, AudioFileClip, CompositeAudioClip, concatenate_videoclips
-        from moviepy.video.fx.all import crop
-
-        bg_video_path = tempfile.mktemp(suffix=".mp4")
-        bucket.blob("assets/background_loop.mp4").download_to_filename(bg_video_path)
-
-        ac = AudioFileClip(audio_path)
-        vc = VideoFileClip(bg_video_path)
-        vc = crop(
-            vc,
-            width=vc.size[1] * (9 / 16), height=vc.size[1],
-            x_center=vc.size[0] / 2, y_center=vc.size[1] / 2
-        ).resize(height=1920)
-
-        loops        = math.ceil(ac.duration / vc.duration) + 1
-        final_vc     = concatenate_videoclips([vc] * loops).set_duration(ac.duration)
-        bg_audio     = final_vc.audio
-        merged_audio = (
-            CompositeAudioClip([bg_audio.volumex(0.3).set_duration(ac.duration), ac])
-            if bg_audio else ac
-        )
-        final_vc = final_vc.set_audio(merged_audio)
-
+        now          = datetime.datetime.now(ZoneInfo("America/New_York"))
+        assets       = video.download_assets(bucket, tempfile.mkdtemp())
+        headlines    = [i.get("headline", "") for i in (briefing["analysis"].get("also_notable") or [])
+                        if isinstance(i, dict)]
         output_video = "/tmp/final.mp4"
-        final_vc.write_videofile(
-            output_video,
-            codec="libx264", audio_codec="aac",
-            fps=24, preset="ultrafast", bitrate="2000k",
-            threads=4, logger=None
-        )
-        print("[VIDEO] Production complete")
+        audio_path   = "/tmp/final.mp3"
+        info = video.render_reel(script_text, headlines, f"[ {now:%a} · {now:%b} {now.day} ]".upper(),
+                                 synthesize, assets, output_video, audio_path)
+        print(f"[VIDEO] Production complete | {info}")
 
         ts = int(time.time())
 
