@@ -32,7 +32,7 @@ import functions_framework
 from google.cloud import texttospeech
 from google.cloud import storage
 
-import json, tempfile, time, math, random, datetime, re, html
+import json, tempfile, time, math, random, datetime, re, html, email.utils
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import httpx
 from urllib.parse import urlparse
@@ -40,6 +40,7 @@ from typing import Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup
+from xml.etree import ElementTree
 
 
 # ============================================================
@@ -55,6 +56,25 @@ PRIVATE_PREFIX  = "private/notes/"   # in the working bucket; never public
 
 # Pass 1 reads the whole context, so this is what the model actually sees (~8-10 fragments).
 RAG_CONTEXT_CHAR_LIMIT = 14000
+
+# Trade-press feeds read alongside Google Alerts; alerts alone miss most CGT manufacturing news.
+FEEDS = [
+    "https://www.cgtlive.com/rss",
+    "https://www.bioprocessintl.com/rss.xml",
+    "https://www.fiercepharma.com/rss/manufacturing/xml",
+    "https://www.biopharmadive.com/feeds/news/",
+    "https://www.biopharmadive.com/feeds/topic/gene-therapy/",
+    "https://endpts.com/feed",
+    "https://www.genengnews.com/feed",
+    "https://www.regmednet.com/feed/",
+    "https://www.labiotech.eu/feed/",
+    "https://www.nature.com/nbt.rss",
+    "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/biologics/rss.xml",
+    "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/press-releases/rss.xml",
+]
+FEED_MAX_AGE_HOURS = 36
+FEED_MAX_ITEMS     = 8      # per feed, newest first
+MAX_FACT_AGE_DAYS  = 30     # older facts are background, not news
 
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
@@ -260,6 +280,70 @@ ITEMS:
     print(f"[TRIAGE] {len(results)}/{len(fragments)} tagged | core={tiers.count('core')} "
           f"adjacent={tiers.count('adjacent')} skip={tiers.count('skip')}")
     return results
+
+
+def parse_feed_date(stamp: Optional[str]) -> Optional[datetime.datetime]:
+    # RSS uses RFC 822, Atom uses ISO 8601, and Fierce uses its own "Oct 12, 2026 7:44am".
+    stamp = (stamp or "").strip()
+    parsers = (lambda v: datetime.datetime.fromisoformat(v.replace("Z", "+00:00")),
+               email.utils.parsedate_to_datetime,
+               lambda v: datetime.datetime.strptime(v, "%b %d, %Y %I:%M%p"))
+    for parse in parsers:
+        try:
+            when = parse(stamp)
+            return when if when.tzinfo else when.replace(tzinfo=datetime.timezone.utc)
+        except (TypeError, ValueError, IndexError):
+            continue
+    return None
+
+
+def fetch_feed(url: str, since: datetime.datetime) -> list:
+    """Recent items from one RSS or Atom feed as {title, url}; an unreachable feed just returns []."""
+    try:
+        r = httpx.get(url, headers={"User-Agent": random.choice(USER_AGENTS)},
+                      timeout=HTTPX_TIMEOUT, follow_redirects=True)
+        r.raise_for_status()
+        root = ElementTree.fromstring(r.content)
+    except Exception as e:
+        print(f"[FEEDS] {type(e).__name__} | {url}")
+        return []
+    items = []
+    for node in root.iter():
+        tag = node.tag.rsplit("}", 1)[-1]
+        if tag not in ("item", "entry"):
+            continue
+        fields = {c.tag.rsplit("}", 1)[-1]: c for c in node}
+        # itertext: some feeds (Fierce) wrap the title in a child element, leaving .text empty.
+        title = "".join(fields["title"].itertext()).strip() if "title" in fields else ""
+        link  = fields.get("link")
+        href  = ((link.text or "").strip() or link.get("href", "")) if link is not None else ""
+        stamp = next((fields[k].text for k in ("pubDate", "published", "updated", "date") if k in fields), None)
+        when = parse_feed_date(stamp)
+        if title and href.startswith("http") and (when is None or when >= since):
+            items.append({"title": title, "url": href})
+        if len(items) >= FEED_MAX_ITEMS:
+            break
+    return items
+
+
+def fetch_feeds(now: datetime.datetime) -> list:
+    since = now - datetime.timedelta(hours=FEED_MAX_AGE_HOURS)
+    with ThreadPoolExecutor(max_workers=len(FEEDS)) as executor:
+        per_feed = list(executor.map(lambda u: fetch_feed(u, since), FEEDS))
+    for url, items in zip(FEEDS, per_feed):
+        print(f"[FEEDS] {len(items):2d} | {url}")
+    return [item for items in per_feed for item in items]
+
+
+def merge_feed_articles(articles: list, feed_items: list) -> list:
+    # Feeds are already capped per source, so they skip the per-domain cap; only drop repeat URLs.
+    seen = {a.get("url") for a in articles}
+    merged = list(articles)
+    for item in feed_items:
+        if item["url"] not in seen:
+            seen.add(item["url"])
+            merged.append({**item, "title": html.unescape(item["title"])})
+    return merged
 
 
 def deduplicate_by_domain(articles: list, max_per_domain: int = 3, hard_cap: int = 150) -> list:
@@ -531,7 +615,7 @@ Return JSON:
 }}
 
 Rules:
-- Lead: the most important "core" fact with medium or high strength that is actually new. days_old over 30 means background, not news: never lead with it, and if you mention it, give its date. A source_url containing /opinion/, /perspective/, /blog/ or /sponsored/ is commentary, not news. If no core fact qualifies, lead with the strongest new fact of any tier and say plainly in why_it_matters that it was a quiet day for CGT manufacturing news.
+- Lead: the most important "core" fact with medium or high strength that is actually new. days_old over 30 means background, not news: never lead with it, and if you mention it, give its date. A source_url containing /opinion/, /perspective/, /blog/, /sponsored/ or /spons/ is commentary or advertising, not news. If no core fact qualifies, lead with the strongest new fact of any tier. Don't apologize for it or say what it isn't (never \"while not directly about manufacturing\"); say what it means for CGT manufacturing and quality teams.
 - also_notable: 2 or 3 other items, ordered by how much they matter to CGT manufacturing and quality teams: CGT and biomanufacturing first, then gene editing, AI in drug discovery and lab automation. Leave out curiosities far from that (neurotech demos, consumer health, product advertorials). Don't repeat the lead.
 - confidence: "high" only if the lead comes from direct news reporting or a primary source with a clear date. Opinion pieces, vendor content, or headline-only sources mean "medium" or "low". Say which in the reason.
 - Use only the facts. Mark inference with "likely" or "may". No numbers, names or dates that aren't in the facts.
@@ -644,6 +728,9 @@ def write_briefing(api_key: str, articles: list, prior_facts: list,
     so it can be run locally against a saved article list."""
     now = now or datetime.datetime.now(ZoneInfo("America/New_York"))
 
+    articles = merge_feed_articles(articles, fetch_feeds(now))
+    print(f"[FEEDS] {len(articles)} articles with feeds")
+
     raw_fragments = fetch_all_articles(articles)
     content_count = len([f for f in raw_fragments if f and '[Signal Only]' not in f])
     print(f"[SCRAPER] {content_count}/{len(articles)} yielded content")
@@ -654,6 +741,10 @@ def write_briefing(api_key: str, articles: list, prior_facts: list,
         return None
 
     facts = pass1_extract_facts(api_key, ranked_context, sources)
+    fresh = [f for f in facts if (fact_age_days(f, now.date()) or 0) <= MAX_FACT_AGE_DAYS]
+    if len(fresh) < len(facts):
+        print(f"[PASS 1] Dropped {len(facts) - len(fresh)} facts older than {MAX_FACT_AGE_DAYS} days")
+    facts = fresh
     if not facts:
         print("[PASS 1] No facts extracted; nothing to publish today")
         return None
@@ -748,9 +839,9 @@ def generate_content(cloud_event):
         print(f"[RAG] After dedup: {len(articles)} articles")
 
         if len(articles) == 0:
-            print("[RAG] ⚠️ CRITICAL: Zero articles in payload")
+            # Not fatal any more: the trade-press feeds still give the briefing something to work with.
+            print("[RAG] ⚠️ Zero alert articles in payload; continuing with feeds only")
             print("[RAG] Check Apps Script logs for Gmail sourcing issues")
-            return
 
         prior_facts = load_memory(bucket)
         briefing    = write_briefing(api_key, articles, prior_facts)
